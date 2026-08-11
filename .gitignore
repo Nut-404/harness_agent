@@ -5,3 +5,4 @@ __pycache__/
 .DS_Store
 .task_outputs/
 .transcripts/
+.memory/

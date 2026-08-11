@@ -8,6 +8,9 @@ from dotenv import load_dotenv
 from openai import OpenAI
 from typing import Optional
 
+import time
+import re
+
 import ast
 import yaml
 #python的日志
@@ -24,15 +27,24 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-
-#开启llm客户端
-
+#获取工作目录，项目父目录
 WORKDIR = Path.cwd()
+#开启llm客户端
 client = OpenAI(
     api_key=os.environ["DEEPSEEK_API_KEY"],
     base_url=os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
 )
 
+#记忆文件路径，在父目录下
+MEMORY_DIR = WORKDIR / ".memory"
+#具体记忆文件，总表
+MEMORY_INDEX = MEMORY_DIR / "MEMORY.md"
+#确保存在记忆文件路径
+MEMORY_DIR.mkdir(exist_ok=True)
+#设置记忆类型
+MEMORY_TYPES = ("user", "feedback", "project", "reference")
+
+#skill文件路径
 SKILLS_DIR = WORKDIR/"skills"
 
 #模型信息
@@ -53,7 +65,7 @@ SUB_SYSTEM = (
 #todo_write, 模型的规划，让模型知道下一步该做什么，没做什么，目标是什么
 CURRENT_TODOS = []
 
-#组成提示词的部分。提取skill的meta，用sop来帮llm规划任务完成路径
+#组成提示词的部分。提取skill和memory的meta，用sop来帮llm规划任务完成路径
 def _parse_frontmatter(text: str):
     #不存在meta部分
     if not text.startswith("---"):
@@ -71,6 +83,318 @@ def _parse_frontmatter(text: str):
 
     return meta, parts[2].strip()
 
+#记忆模块，从llm提取出的名字里得到新的memory文字来作为memory文件的文件名
+def _memory_slug(name: str) -> str:
+    slug = name.lower().strip()
+    slug = slug.replace(" ", "-").replace("/", "-")
+    return slug or "memory"
+
+#写memory文件
+def write_memory_file(name: str, mem_type: str, description: str, body: str) -> str:
+    #非规定类型，设定默认值
+    if mem_type not in MEMORY_TYPES:
+        mem_type = "user"
+
+    slug = _memory_slug(name)
+    filename = f"{slug}.md"
+    filepath = MEMORY_DIR / filename
+    #把数据写进去
+    filepath.write_text(
+        f"---\n"
+        f"name: {name}\n"
+        f"description: {description}\n"
+        f"type: {mem_type}\n"
+        f"---\n\n"
+        f"{body}\n"
+    )
+
+    #改动记忆文件，重新刷新给llm的记忆表
+    _rebuild_index()
+    return f"Wrote memory: {filename}"
+
+#建立记忆表，跟skill一样，包含name和description
+def _rebuild_index():
+    lines = []
+
+    for memory_file in sorted(MEMORY_DIR.glob("*.md")):
+        if memory_file.name == "MEMORY.md":
+            continue
+
+        #读取text并拆分
+        raw = memory_file.read_text()
+        meta, body = _parse_frontmatter(raw)
+
+        #这里meta已经是dict
+        name = meta.get("name", memory_file.stem)
+        description = meta.get("description", body.split("\n")[0][:80])
+
+        lines.append(f"- [{name}]({memory_file.name}) - {description}")
+
+    content = "\n".join(lines)
+    if content:
+        content += "\n"
+    #memory.md为总表
+    MEMORY_INDEX.write_text(content)
+
+#阅读这个memory的总表，里面有memories的name和description
+def read_memory_index() -> str:
+    if not MEMORY_INDEX.exists():
+        return ""
+
+    return MEMORY_INDEX.read_text().strip()
+
+#阅读某一个记忆文件
+def read_memory_file(filename: str) -> str:
+    memory_path = (MEMORY_DIR / filename).resolve()
+
+    if not memory_path.is_relative_to(MEMORY_DIR.resolve()):
+        return f"Error: memory path escapes memory directory: {filename}"
+
+    if not memory_path.exists():
+        return f"Error: memory file not found: {filename}"
+
+    return memory_path.read_text()
+
+#列出所有的记忆文件的详细信息
+def list_memory_files() -> list:
+    memories = []
+
+    for memory_file in sorted(MEMORY_DIR.glob("*.md")):
+        if memory_file.name == "MEMORY.md":
+            continue
+
+        raw = memory_file.read_text()
+        meta, body = _parse_frontmatter(raw)
+
+        memories.append({
+            "filename": memory_file.name,
+            "name": meta.get("name", memory_file.stem),
+            "description": meta.get("description", ""),
+            "type": meta.get("type", "user"),
+            "body": body,
+        })
+
+    return memories
+
+
+#选出具体memory信息。参数messages时短期的对话记忆。参考用户之前三次说的来推出当前需要什么memory文件
+def select_relevant_memories(messages: list, max_items: int = 5) -> list:
+    #得到详细的记忆文件列表
+    files = list_memory_files()
+    if not files:
+        return []
+    #提取最近三次的user输入
+    recent_parts = []
+    for msg in reversed(messages):
+        #如果是用户说的
+        if msg.get("role") == "user":
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                recent_parts.append(content)
+
+        if len(recent_parts) >= 3:
+            break
+
+    #用户输入组合成一个str
+    recent_text = " ".join(reversed(recent_parts)).lower()
+    if not recent_text.strip():
+        return []
+
+    #这个keywords怎么得出来的，为什么这样算
+    keywords = []
+    for word in recent_text.replace("-", " ").replace("_", " ").split():
+        word = word.strip(".,!?;:()[]{}'\"").lower()
+        if len(word) >= 4:
+            keywords.append(word)
+
+    selected = []
+    for memory in files:
+        searchable = (
+            memory["name"] + " " +
+            memory["description"] + " " +
+            memory["body"]
+        ).lower()
+
+        if any(keyword in searchable for keyword in keywords):
+            selected.append(memory["filename"])
+
+        if len(selected) >= max_items:
+            break
+
+    return selected
+
+#agent loop完成后，对messages[-10:]做记忆提取和更新
+def extract_memories(messages: list)->None:
+    #最晚的十条作为记忆提取目标
+    dialogue_parts = []
+    for msg in messages[-10:]:
+        role = msg.get("role", "?")
+        content = msg.get("content", "")
+        #确保content不为空
+        if isinstance(content, str) and content.strip():
+            dialogue_parts.append(f"{role}: {content}")
+    #变成str
+    dialogue = "\n".join(dialogue_parts)
+    if not dialogue.strip():
+        return
+    #得到所有的memory详细信息
+    existing = list_memory_files()
+    #变成str
+    existing_text = "\n".join(
+        f"- {m['name']}: {m['description']}"
+        for m in existing
+    ) or "(none)"
+
+    #构建pormpt
+    prompt = (
+        "Extract user preferences, constraints, or project facts from this dialogue.\n"
+        "Return a JSON array. Each item: {name, type, description, body}.\n"
+        "- name: short kebab-case identifier, e.g. 'user-preference-tabs'\n"
+        "- type: one of 'user', 'feedback', 'project', 'reference'\n"
+        "- description: one-line summary for index lookup\n"
+        "- body: full detail in markdown\n"
+        "If nothing new or already covered by existing memories, return [].\n\n"
+        f"Existing memories:\n{existing_text}\n\n"
+        f"Dialogue:\n{dialogue[:4000]}"
+    )
+
+    #开始问llm
+    try:
+
+        response = client.chat.completions.create(
+            model= MODEL,
+            messages= [
+                {
+                    "role": "system",
+                    "content": "You extract durable agent memory as JSON. Do not call tools.",
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                },
+            ],
+            max_tokens= 800
+        )
+
+        #拿到答案
+        text = response.choices[0].message.content or "[]"
+        #正则查找，查找左边为[, 右边为]，中间任意的结构。我们希望返回list
+        match = re.search(r"\[.*\]", text, re.DOTALL)
+        if not match:
+            return
+
+        #把返回的json变成python list
+        items = json.loads(match.group())
+        if not isinstance(items, list):
+            return
+
+        count = 0
+        for item in items:
+            #格式错误
+            if not isinstance(item, dict):
+                continue
+
+            #items是list， item是dict
+            name = item.get("name") or f"memory-{int(time.time())}"#拿到名字，没有就用时间戳代替
+            mem_type = item.get("type", "user")
+            description = item.get("description", "")
+            body = item.get("body", "")
+
+            #这两个必须存在
+            if description and body:
+                write_memory_file(name, mem_type, description, body)
+                count += 1
+
+        if count:
+            print(f"[Memory: extracted {count} new memories]")
+
+    except Exception as e:
+        logger.warning("memory extraction failed: %s", e)
+
+
+#记忆文件太多后，需要去重，降低数量
+#memory记忆数量上限
+CONSOLIDATE_THRESHOLD = 10
+#依旧使用llm来总结memory并写入
+def consolidate_memories() -> None:
+    #拿到所有的记忆文件细节
+    files = list_memory_files()
+
+    if len(files) < CONSOLIDATE_THRESHOLD:
+        return
+
+    #拼接所有的细节
+    catalog = "\n\n".join(
+        f"## {f['filename']}\n"
+        f"name: {f['name']}\n"
+        f"type: {f['type']}\n"
+        f"description: {f['description']}\n\n"
+        f"{f['body']}"
+        for f in files
+    )
+
+    prompt = (
+        "Consolidate these memory files.\n"
+        "Rules:\n"
+        "1. Merge duplicate memories.\n"
+        "2. Remove outdated or contradicted memories.\n"
+        "3. Preserve important user preferences and project constraints.\n"
+        "4. Keep useful details in body.\n"
+        "Return ONLY a JSON array. Each item must be:\n"
+        "{'name': str, 'type': str, 'description': str, 'body': str}\n\n"
+        f"{catalog[:16000]}"
+    )
+
+    try:
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You consolidate durable agent memories as JSON. Do not call tools.",
+                },
+                {
+                    "role": "user",
+                    "content": prompt,
+                },
+            ],
+            max_tokens=3000,
+        )
+
+        text = response.choices[0].message.content or "[]"
+        match = re.search(r"\[.*\]", text, re.DOTALL)
+        if not match:
+            return
+
+        items = json.loads(match.group())
+        if not isinstance(items, list):
+            return
+
+        for memory_file in MEMORY_DIR.glob("*.md"):
+            if memory_file.name != "MEMORY.md":
+                memory_file.unlink()
+
+        count = 0
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+
+            name = item.get("name") or f"memory-{int(time.time())}"
+            mem_type = item.get("type", "user")
+            description = item.get("description", "")
+            body = item.get("body", "")
+
+            if description and body:
+                write_memory_file(name, mem_type, description, body)
+                count += 1
+
+        print(f"[Memory: consolidated {len(files)} memories into {count}]")
+
+    except Exception as e:
+        logger.warning("memory consolidation failed: %s", e)
+
+
+#skill注册表
 SKILL_REGISTRY = {}
 
 #扫描所有的.md文件，然后组成skill注册表
@@ -105,6 +429,7 @@ def _scan_skills():
             "content": raw,
         }
 
+#用skill注册表创建概括性的总结str
 def list_skills() -> str:
     if not SKILL_REGISTRY:
         return "(no skills found)"
@@ -115,24 +440,89 @@ def list_skills() -> str:
 
     return "\n".join(lines)
 
-#用skills来重新组成提示词
-def build_system() -> str:
-    #每次都清空
+#用skills和memory来重新组成提示词
+#用来检查是否还需要拼接，或者和上次数据一样直接返回
+LAST_SYSTEM_KEY = None
+LAST_SYSTEM_PROMPT = None
+
+def build_system(memories: str = "") -> str:
+    global LAST_SYSTEM_KEY, LAST_SYSTEM_PROMPT
+    # 每次请求前重新扫描 skill 目录，让新增/修改的 skill 生效。
     SKILL_REGISTRY.clear()
-    #写入新的数据到注册表
     _scan_skills()
-
+    #列出所有的skill
     skills_catalog = list_skills()
+    #memory.md文件总结
+    memory_index = read_memory_index()
+    #列出所有支持的工具能力
+    enabled_tools = ",".join(TOOL_HANDLERS.keys())
 
-    return (
+    #组装system_key
+    system_key = json.dumps(
+        {
+            "workdir": str(WORKDIR),
+            "skills_catalog": skills_catalog,
+            "memory_index": memory_index,
+            "memories": memories,
+            "enable_tools": enabled_tools
+        },
+        sort_keys= True,
+        ensure_ascii= False
+    )
+    #区分一下是否数据改变，是否需要重新拼接
+    if system_key == LAST_SYSTEM_KEY and LAST_SYSTEM_PROMPT:
+        return LAST_SYSTEM_PROMPT
+    #分区块来组装prompt
+    sections = []
+    #要求工作地区，工作目录，限制工作范围
+    sections.append(
         f"You are a coding agent at {WORKDIR}. "
+        "Use tools to solve coding tasks carefully."
+    )
+    #要求任务步骤，要先写todo
+    sections.append(
         "Before starting any multi-step task, use todo_write to plan your steps. "
-        "Update status as you go.\n"
-        f"Skills available:\n{skills_catalog}\n"
+        "Update status as you go."
+    )
+    #展现可用工具
+    sections.append(
+        "Available tool names:\n"
+        f"{enabled_tools}"
+    )
+    #展现可用技能
+    sections.append(
+        "Skills available:\n"
+        f"{skills_catalog}\n"
         "When a skill seems relevant, use load_skill to read its full instructions."
     )
 
+    if memory_index:
+        sections.append(
+            "Memories available:\n"
+            f"{memory_index}"
+        )
+
+    if memories:
+        sections.append(
+            "Relevant memory details:\n"
+            f"{memories}"
+        )
+
+    sections.append(
+        "Memory rules:\n"
+        "- Memories are long-term user preferences, feedback, project facts, or references.\n"
+        "- Use relevant memory details when they apply to the current task.\n"
+        "- Do not treat todo items or compact summaries as long-term memory."
+    )
+
+    #替代key，下次检查
+    LAST_SYSTEM_KEY = system_key
+    #替代
+    LAST_SYSTEM_PROMPT = "\n\n".join(sections)
+    return LAST_SYSTEM_PROMPT
+
 #验证模型是否返回正确的todo
+#llm应该会返回怎么样的todo list？为什么会返回，是我们在提示词里要求的吗？
 def _normalize_todos(todos):
     if isinstance(todos, str):
         try:
@@ -280,9 +670,11 @@ TOOLS.append({
 
 
 #可以让llm返回一个todos来规划
+#这个todo部分的数据流是怎么样的？
 def run_todo_write(todos: list) -> str:
+    #全局todo list
     global CURRENT_TODOS
-
+    #确实todo list确实是list格式
     todos, error = _normalize_todos(todos)
     if error:
         return error
@@ -291,6 +683,7 @@ def run_todo_write(todos: list) -> str:
 
     lines = ["\n## Current Tasks"]
     for todo in CURRENT_TODOS:
+        #根据status来写icon
         icon = {
             "pending": " ",
             "in_progress": ">",
@@ -443,6 +836,7 @@ PERMISSION_RULES = [
 
 #软拒绝函数，检查是否存在风险行为
 def check_rules(tool_name: str, args: dict) -> Optional[str]:
+    #每条软拒绝规则检查
     for rule in PERMISSION_RULES:
         if tool_name in rule["tools"] and rule["check"](args):
             return rule["message"]
@@ -455,7 +849,7 @@ def ask_user(tool_name: str, args: dict, reason: str) -> str:
     choice = input("   Allow? [y/N] ").strip().lower()
     return "allow" if choice in ("y", "yes") else "deny"
 
-#综合的检查权限函数，要通过硬拒绝或者软拒绝才能返回true，再正常运行
+#综合的检查权限函数，要通过硬拒绝和软拒绝才能返回true，再正常运行
 def check_permission(tool_name: str, args: dict) -> bool:
     if tool_name == "bash":
         reason = check_deny_list(args.get("command", ""))
@@ -472,6 +866,7 @@ def check_permission(tool_name: str, args: dict) -> bool:
     return True
 
 #提取message dict里面的content，返回一个str，拿出文本
+#为sub agent服务，用于作答时用最后一次的回答作为答案
 def extract_text(message) -> str:
     if isinstance(message, dict):
         content = message.get("content", "")
@@ -504,8 +899,13 @@ def spawn_subagent(description: str)->str:
             for tool_call in message.tool_calls:
                 #拿到tool的基本信息
                 tool_name = tool_call.function.name
-                tool_args = json.loads(tool_call.function.arguments or "{}")
-
+                #sub agent同样需要检验
+                try:
+                    tool_args = json.loads(tool_call.function.arguments or "{}")
+                except json.JSONDecodeError as e:
+                    output = f"Error: Invalid JSON arguments for {tool_name}: {e}"
+                    messages.append(make_tool_result_message(tool_call_id= tool_call.id, output= output))
+                    continue
                 #跟主agent一样使用hook来完成检查
                 blocked = trigger_hooks("PreToolUse", tool_name, tool_args)
                 if blocked is not None:
@@ -565,10 +965,13 @@ def compact_history(messages: list, keep_tail: int = COMPACT_KEEP_TAIL) -> list:
     if len(messages) <= COMPACT_TRIGGER_MESSAGES:
         return messages
 
+    #确定尾部切断位置
     tail_start = _safe_tail_start(messages, keep_tail)
+    #切成两半
     old_messages = messages[:tail_start]
     recent_messages = messages[tail_start:]
 
+    #让old_message变成str格式
     conversation = json.dumps(
         old_messages,
         ensure_ascii=False,
@@ -610,6 +1013,33 @@ def compact_history(messages: list, keep_tail: int = COMPACT_KEEP_TAIL) -> list:
 
     return [summary_message, *recent_messages]
 
+#压缩history后，还是可能会导致上下文过大，用来判断是否是上下文过大导致llm返回错误
+def is_prompt_too_long_error(e: Exception):
+    msg = str(e).lower()
+    return (
+        "prompt_too_long" in msg
+        or "prompt is too long" in msg
+        or "context_length_exceeded" in msg
+        or "maximum context length" in msg
+        or "max_context_window" in msg
+    )
+
+#粗略压缩，实验是否是压缩问题，简略压缩后如还有上下文问题，就不是压缩的问题
+def reactive_compact(messages: list):
+    #尾部卡在对话数组第几位
+    tail_start = _safe_tail_start(messages= messages, keep_tail= 5)
+    #留存对话
+    recent_messages = messages[tail_start:]
+    #直接丢弃不总结
+    return [
+        {
+            "role": "user",
+            "content": "[Reactive compact] Earlier conversation was trimmed because the prompt was too long. Continue from the remaining recent context.",
+        },
+        *recent_messages,
+    ]
+
+
 
 def make_tool_result_message(tool_call_id: str, output: str):
     return {
@@ -625,6 +1055,7 @@ HOOKS = {
     "PostToolUse": [],
     "Stop": []
 }
+
 #注册hook函数
 def register_hook(event: str, callback):
     HOOKS[event].append(callback)
@@ -676,13 +1107,26 @@ register_hook("PostToolUse", large_output_hook)
 register_hook("Stop", summary_hook)
 
 
+
 #开始agent loop
 rounds_since_todo = 0
 def agent_loop(messages: list):
     global rounds_since_todo
+    #只能失误一次，压缩过一次之后还不能通过说明是单条memory或者消息太大，再粗糙压缩没有意义
+    attempted_reactive_compact = False
     while True:
+        
         #压缩上下文
         messages[:] = compact_history(messages)
+        #要搜寻相关记忆在记忆文件内
+        selected_memories = select_relevant_memories(messages)
+        memories = ""
+        memory_parts = []
+        for memory_name in selected_memories:
+            memory_parts.append(read_memory_file(memory_name))
+
+        memories = "\n\n".join(memory_parts)
+        
         #加入计划表更新计数器
         if rounds_since_todo >= 3 and messages:
             messages.append({
@@ -692,13 +1136,32 @@ def agent_loop(messages: list):
             rounds_since_todo = 0
         #输出日志
         logger.info("requesting model=%s messages=%d", MODEL, len(messages))
-        #连接llm获得回答
-        response = client.chat.completions.create(
-            model=MODEL,
-            messages=[{"role": "system", "content": build_system()}, *messages],
-            tools=TOOLS,
-            max_tokens=8000,
-        )
+        try:
+            #连接llm获得回答
+            response = client.chat.completions.create(
+                model=MODEL,
+                messages=[{"role": "system", "content": build_system(memories= memories)}, *messages],
+                tools=TOOLS,
+                max_tokens=8000,
+            )
+        except Exception as e:
+            #如果是上下文太长的问题并且还没有粗略压缩过
+            if is_prompt_too_long_error(e) and not attempted_reactive_compact:
+                #日志报错
+                logger.warning("prompt too long; running reactive compact and retrying")
+                #之前没粗略压缩过，现在压缩
+                messages[:] = reactive_compact(messages)
+                #更改压缩记录
+                attempted_reactive_compact = True
+                continue
+            #压缩过了，直接报错
+            logger.warning("model request failed: %s", e)
+            #直接加入短期记忆
+            messages.append({
+                "role": "assistant",
+                "content": f"Error: model request failed: {e}",
+            })
+            return
         
         # SDK 返回的是对象；这里把 assistant message 转成 dict，方便加入 messages。
         message = response.choices[0].message
@@ -711,6 +1174,8 @@ def agent_loop(messages: list):
         #如果回答里没有tool call，直接返回
         if not message.tool_calls:
             logger.info("agent loop finished: finish_reason=%s", response.choices[0].finish_reason)
+            extract_memories(messages= messages)
+            consolidate_memories()
             force = trigger_hooks("Stop", messages)
             if force:
                 messages.append({"role": "user", "content": str(force)})
@@ -723,7 +1188,13 @@ def agent_loop(messages: list):
         for tool_call in message.tool_calls:
             #拿到对应函数的参数
             tool_name = tool_call.function.name
-            tool_args = json.loads(tool_call.function.arguments or "{}")
+            #args可能没有返回正常结果, 如果错误结果要把错误消息传回去等待再次调用
+            try:
+                tool_args = json.loads(tool_call.function.arguments or "{}")
+            except json.JSONDecodeError as e:
+                output = f"Error: invalid JSON arguments for {tool_name}: {e}"
+                messages.append(make_tool_result_message(tool_call_id= tool_call.id, output= output))
+                continue
 
             #用hook来走pretooluse流程
             blocked = trigger_hooks("PreToolUse", tool_name, tool_args)
@@ -767,7 +1238,7 @@ if __name__ == "__main__":
         trigger_hooks("UserPromptSubmit", query)
         history.append({"role": "user", "content": query})
         agent_loop(history)
-        # Print the model's final text response
+        #输出最后一次作答作为答案
         response_content = history[-1].get("content")
         if response_content:
             print(response_content)
