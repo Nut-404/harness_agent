@@ -10,6 +10,7 @@ from typing import Optional
 
 import time
 import re
+import random
 
 import ast
 import yaml
@@ -49,6 +50,21 @@ SKILLS_DIR = WORKDIR/"skills"
 
 #模型信息
 MODEL = os.getenv("MODEL_ID", "deepseek-chat")
+#设置最大token数量
+DEFAULT_MAX_TOKENS = 8000
+#默认token不能满足
+ESCALATED_MAX_TOKENS = 16000
+#设置最大token尝试次数
+MAX_CONTINUATION_RETRIES = 3
+#给token错误后的提示词
+CONTINUATION_PROMPT = (
+    "Output token limit hit. Continue directly from where you stopped. "
+    "Do not repeat earlier content."
+)
+#重新尝试的次数
+MAX_RETRIES = 3
+#重新尝试的延迟量
+BASE_DELAY_MS = 500
 #给llm的初始提示词
 SYSTEM = (
     f"You are a coding agent at {WORKDIR}. "
@@ -64,6 +80,59 @@ SUB_SYSTEM = (
 
 #todo_write, 模型的规划，让模型知道下一步该做什么，没做什么，目标是什么
 CURRENT_TODOS = []
+#task, 目标是什么，todo是任务，是步骤，task是目标
+TASKS = {}
+CURRENT_TASK_ID = None
+TASK_STATUSES = ("pending", "in_progress", "completed", "failed")
+
+#task id 生成
+def make_task_id()->str:
+    return f"task-{int(time.time())}"
+
+#用任务描述创建任务
+def create_task(description: str):
+    global CURRENT_TASK_ID
+
+    task_id = make_task_id()
+    now = int(time.time())
+
+    #创建任务
+    task = {
+        "id": task_id,
+        "description": description,
+        "status": "in_progress",
+        "created_at": now,
+        "updated_at": now,
+        "result": ""
+    }
+
+    CURRENT_TASK_ID = task_id
+    TASKS[task_id] = task
+    return task
+
+#更新task
+def update_task(task_id: str, status: str, result: str = "") -> str:
+    if task_id not in TASKS:
+        return f"Error: task not found: {task_id}"
+
+    if status not in TASK_STATUSES:
+        return f"Error: invalid task status: {status}"
+
+    task = TASKS[task_id]
+    task["status"] = status
+    task["updated_at"] = int(time.time())
+
+    if result:
+        task["result"] = result
+
+    return f"Updated task {task_id} to {status}"
+
+#读取当前任务，返回任务
+def get_current_task():
+    if CURRENT_TASK_ID is None:
+        return None
+
+    return TASKS.get(CURRENT_TASK_ID)
 
 #组成提示词的部分。提取skill和memory的meta，用sop来帮llm规划任务完成路径
 def _parse_frontmatter(text: str):
@@ -444,7 +513,7 @@ def list_skills() -> str:
 #用来检查是否还需要拼接，或者和上次数据一样直接返回
 LAST_SYSTEM_KEY = None
 LAST_SYSTEM_PROMPT = None
-
+#创建初始提示词
 def build_system(memories: str = "") -> str:
     global LAST_SYSTEM_KEY, LAST_SYSTEM_PROMPT
     # 每次请求前重新扫描 skill 目录，让新增/修改的 skill 生效。
@@ -456,6 +525,8 @@ def build_system(memories: str = "") -> str:
     memory_index = read_memory_index()
     #列出所有支持的工具能力
     enabled_tools = ",".join(TOOL_HANDLERS.keys())
+    #给出任务
+    current_task = get_current_task()
 
     #组装system_key
     system_key = json.dumps(
@@ -464,7 +535,8 @@ def build_system(memories: str = "") -> str:
             "skills_catalog": skills_catalog,
             "memory_index": memory_index,
             "memories": memories,
-            "enable_tools": enabled_tools
+            "enable_tools": enabled_tools,
+            "current_task": current_task
         },
         sort_keys= True,
         ensure_ascii= False
@@ -489,6 +561,14 @@ def build_system(memories: str = "") -> str:
         "Available tool names:\n"
         f"{enabled_tools}"
     )
+    #展示当前任务
+    if current_task:
+        sections.append(
+            "Current task: \n"
+            f"- id: {current_task['id']}\n"
+            f"- status: {current_task['status']}\n"
+            f"- description: {current_task['description']}"
+        )
     #展现可用技能
     sections.append(
         "Skills available:\n"
@@ -644,6 +724,35 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "task_status",
+            "description": "Show the current task state.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function":{
+            "name": "task_update",
+            "description": "Update the current task status and optional result.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "status": {
+                        "type": "string",
+                        "enum": ["pending", "in_progress", "completed", "failed"],
+                    },
+                    "result": {"type": "string"}
+                },
+                "required": ["status"]
+            },
+        },
+    },
 ]
 #加载skill详细信息的函数
 def load_skill(name: str) -> str:
@@ -775,6 +884,20 @@ def run_bash(command: str):
     except (FileNotFoundError, OSError) as e:
         return f"Error: {e}"
 
+#llm获取task的函数
+def run_task_status()->str:
+    task = get_current_task()
+    if not task:
+        return "No current task"
+    return json.dumps(task, ensure_ascii= False, indent= 2)
+
+#llm更新task
+def run_task_update(status: str, result: str = "")->str:
+    task = get_current_task()
+    if not task:
+        return "Error: no current task"
+    return update_task(task["id"], status, result)
+
 #str name对应到具体的执行函数
 TOOL_HANDLERS = {
     "bash": run_bash,
@@ -784,6 +907,8 @@ TOOL_HANDLERS = {
     "glob": run_glob,
     "todo_write": run_todo_write,
     "load_skill": load_skill,
+    "task_status": run_task_status,
+    "task_update": run_task_update,
 }
 
 #sub agent的可用工具，不能再给task，因为可能会无限递归
@@ -864,6 +989,7 @@ def check_permission(tool_name: str, args: dict) -> bool:
             return False
 
     return True
+
 
 #提取message dict里面的content，返回一个str，拿出文本
 #为sub agent服务，用于作答时用最后一次的回答作为答案
@@ -1039,6 +1165,54 @@ def reactive_compact(messages: list):
         *recent_messages,
     ]
 
+#对于请求暂时不可用进行处理
+#创建随机时间
+def retry_delay(attempt: int)->float:
+    #基础延时
+    base = min(BASE_DELAY_MS * (2**attempt), 32000)/1000
+    #加入随机量
+    jitter = random.uniform(0, base*0.25)
+
+    return base+jitter
+
+#识别是否是模型暂时不能响应
+def is_transient_model_error(e: Exception):
+    #错误信息
+    msg = str(e).lower()
+    #找到错误名称
+    name = type(e).__name__.lower()
+    return (
+        "429" in msg
+        or "rate limit" in msg
+        or "ratelimit" in name
+        or "529" in msg
+        or "overloaded" in msg
+        or "timeout" in msg
+        or "temporarily unavailable" in msg
+    )
+
+#重新尝试函数，fn为函数名
+def with_retry(fn):
+    for attempt in range(MAX_RETRIES):
+        try:
+            return fn()
+        except Exception as e:
+            #不是暂时的连接问题
+            if not is_transient_model_error(e):
+                raise
+            #添加等待量
+            delay = retry_delay(attempt= attempt)
+            logger.warning(
+                "transient model error; retrying %s/%s after %.1fs: %s",
+                attempt + 1,
+                MAX_RETRIES,
+                delay,
+                e,
+            )
+            time.sleep(delay)
+    raise RuntimeError(f"Max retries ({MAX_RETRIES}) exceeded")
+
+
 
 
 def make_tool_result_message(tool_call_id: str, output: str):
@@ -1114,6 +1288,10 @@ def agent_loop(messages: list):
     global rounds_since_todo
     #只能失误一次，压缩过一次之后还不能通过说明是单条memory或者消息太大，再粗糙压缩没有意义
     attempted_reactive_compact = False
+    #单次对话的token数量更改bool
+    has_escalated_max_tokens = False
+    max_tokens = DEFAULT_MAX_TOKENS
+    continuation_retries = 0
     while True:
         
         #压缩上下文
@@ -1138,11 +1316,13 @@ def agent_loop(messages: list):
         logger.info("requesting model=%s messages=%d", MODEL, len(messages))
         try:
             #连接llm获得回答
-            response = client.chat.completions.create(
-                model=MODEL,
-                messages=[{"role": "system", "content": build_system(memories= memories)}, *messages],
-                tools=TOOLS,
-                max_tokens=8000,
+            response = with_retry(
+                lambda: client.chat.completions.create(
+                    model=MODEL,
+                    messages=[{"role": "system", "content": build_system(memories=memories)}, *messages],
+                    tools=TOOLS,
+                    max_tokens=max_tokens,
+                )
             )
         except Exception as e:
             #如果是上下文太长的问题并且还没有粗略压缩过
@@ -1161,6 +1341,14 @@ def agent_loop(messages: list):
                 "role": "assistant",
                 "content": f"Error: model request failed: {e}",
             })
+            #更新任务状态为failed
+            current_task = get_current_task()
+            if current_task and current_task["status"] == "in_progress":
+                update_task(
+                    current_task["id"],
+                    "failed",
+                    f"model request failed: {e}",
+                )
             return
         
         # SDK 返回的是对象；这里把 assistant message 转成 dict，方便加入 messages。
@@ -1169,6 +1357,39 @@ def agent_loop(messages: list):
 
         # 追加 assistant 原始消息，里面可能带有 tool_calls。
         messages.append(assistant_message)
+
+        #看是否是因为token限制导致回答不完整
+        finish_reason = response.choices[0].finish_reason
+
+        #如果是token原因导致停止
+        if finish_reason == "length":
+            #如果还没有更改过最大限制token数
+            if not has_escalated_max_tokens:
+                #尝试更改token数能不能获得完整答案
+                max_tokens = ESCALATED_MAX_TOKENS
+                has_escalated_max_tokens = True
+                #垃圾信息要删除
+                messages.pop()
+                logger.warning(
+                    "max_tokens hit; escalating %s -> %s",
+                    DEFAULT_MAX_TOKENS,
+                    ESCALATED_MAX_TOKENS
+                )
+                #直接进入下一轮循环，重新获得输出
+                continue
+            #在合理的尝试次数内还是要加入messages
+            if continuation_retries < MAX_CONTINUATION_RETRIES:
+                messages.append({"role": "user", "content": CONTINUATION_PROMPT})
+                continuation_retries+=1
+                logger.warning(
+                    "max_tokens hit after escalation; requesting continuation %s/%s",
+                    continuation_retries,
+                    MAX_CONTINUATION_RETRIES
+                )
+                continue
+
+            logger.warning("max_tokens recovery limit reached")
+            return
 
         # DeepSeek/OpenAI 用 tool_calls 表示模型要继续调用工具。
         #如果回答里没有tool call，直接返回
@@ -1180,6 +1401,14 @@ def agent_loop(messages: list):
             if force:
                 messages.append({"role": "user", "content": str(force)})
                 continue
+            #更新任务状态
+            current_task = get_current_task()
+            if current_task and current_task["status"] == "in_progress":
+                update_task(
+                    current_task["id"],
+                    "completed",
+                    extract_text(assistant_message)
+                )
 
             return
 
@@ -1237,6 +1466,10 @@ if __name__ == "__main__":
             break
         trigger_hooks("UserPromptSubmit", query)
         history.append({"role": "user", "content": query})
+        #加入任务
+        if get_current_task() is None:
+            task = create_task(query)
+            print(f"[Task created] {task['id']}: {task['description']}")
         agent_loop(history)
         #输出最后一次作答作为答案
         response_content = history[-1].get("content")
