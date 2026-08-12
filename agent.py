@@ -1,4 +1,4 @@
-import json
+﻿import json
 import logging
 import os
 import subprocess
@@ -11,6 +11,7 @@ from typing import Optional
 import time
 import re
 import random
+import threading
 
 import ast
 import yaml
@@ -84,6 +85,92 @@ CURRENT_TODOS = []
 TASKS = {}
 CURRENT_TASK_ID = None
 TASK_STATUSES = ("pending", "in_progress", "completed", "failed")
+
+#background后台进程记录
+#记录详细的后台任务信息，bg_id -> {tool_name, args, status, started_at}
+BACKGROUND_TASKS = {}
+#bg_id -> 工具执行结果字符串
+BACKGROUND_RESULTS = {}
+#多线程同时读写 dict 时加锁
+BACKGROUND_LOCK = threading.Lock()
+#用来生成 bg_id
+BACKGROUND_COUNTER = 0
+
+#生成bg_id
+def make_background_id()->str:
+    global BACKGROUND_COUNTER
+    #with只允许一个线程进入
+    with BACKGROUND_LOCK:
+        BACKGROUND_COUNTER += 1
+        return f"bg-{BACKGROUND_COUNTER}"
+
+#生成任务
+def start_background_task(tool_call_id: str, tool_name: str, tool_args: dict) -> str:
+    bg_id = make_background_id()
+    command = tool_args.get("command", tool_name)
+    #创建
+    with BACKGROUND_LOCK:
+        BACKGROUND_TASKS[bg_id] = {
+            "tool_call_id": tool_call_id,
+            "tool_name": tool_name,
+            "args": tool_args,
+            "command": command,
+            "status": "running",
+            "started_at": int(time.time())
+        }
+    #多线程函数
+    def worker():
+        handler = TOOL_HANDLERS.get(tool_name)
+        if handler is None:
+            output = f"Error: Unknown tool {tool_name}"
+        else:
+            try:
+                output = handler(**tool_args)
+            except Exception as e:
+                output = f"Error: {e}"
+        #运行完了再修改task状态
+        with BACKGROUND_LOCK:
+            BACKGROUND_TASKS[bg_id]["status"] = "completed"
+            BACKGROUND_TASKS[bg_id]["completed_at"] = int(time.time())
+            BACKGROUND_RESULTS[bg_id] = str(output)
+    #开启多线程
+    thread = threading.Thread(target= worker, daemon= True)
+    thread.start()
+    return bg_id
+
+#收集完成的task
+def collect_background_results() -> list:
+    #已完成的task
+    with BACKGROUND_LOCK:
+        ready_ids = [
+            bg_id
+            for bg_id, task in BACKGROUND_TASKS.items()
+            if task["status"] == "completed"
+        ]
+
+    notifications = []
+    #对已完成的进行总结
+    for bg_id in ready_ids:
+        with BACKGROUND_LOCK:
+            task = BACKGROUND_TASKS.pop(bg_id)
+            output = BACKGROUND_RESULTS.pop(bg_id, "")
+
+        summary = output[:200]
+        notifications.append(
+            f"<task_notification>\n"
+            f"  <task_id>{bg_id}</task_id>\n"
+            f"  <status>completed</status>\n"
+            f"  <command>{task['command']}</command>\n"
+            f"  <summary>{summary}</summary>\n"
+            f"</task_notification>"
+        )
+
+    return notifications
+
+#用来判断无工具调用时是否可以自动把in_progress变成completed
+def has_running_background_tasks() -> bool:
+    with BACKGROUND_LOCK:
+        return any(task["status"] == "running" for task in BACKGROUND_TASKS.values())
 
 #task id 生成
 def make_task_id()->str:
@@ -634,7 +721,7 @@ TOOLS = [
             "description": "Run a shell command.",
             "parameters": {
                 "type": "object",
-                "properties": {"command": {"type": "string"}},
+                "properties": {"command": {"type": "string"}, "run_in_background": {"type": "boolean"}},
                 "required": ["command"],
             },
         },
@@ -860,7 +947,7 @@ def run_glob(pattern: str) -> str:
     except Exception as e:
         return f"Error: {e}"
 
-def run_bash(command: str):
+def run_bash(command: str, run_in_background: bool = False):
     #异常拦截
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
     if any(d in command for d in dangerous):
@@ -883,6 +970,28 @@ def run_bash(command: str):
         return "Error: Timeout (120s)"
     except (FileNotFoundError, OSError) as e:
         return f"Error: {e}"
+
+#判断是否是慢指令
+def is_slow_operation(tool_name: str, tool_args: dict)->bool:
+    #不是bash命令运行的
+    if tool_name != "bash":
+        return False
+    #取出命令
+    command = tool_args.get("command", "").lower()
+    #需要background的命令
+    slow_keywords = [
+        "install", "build", "test", "deploy", "compile",
+        "docker build", "pip install", "npm install",
+        "cargo build", "pytest", "make",
+    ]
+    return any(keyword in command for keyword in slow_keywords)
+
+#判断是否需要background run, harness的判断作为最后的防线，第一顺位是llm输入run_in_background
+def should_run_background(tool_name: str, tool_args: dict)->bool:
+    if tool_args.get("run_in_background"):
+        return True
+    return is_slow_operation(tool_name= tool_name, tool_args= tool_args)
+
 
 #llm获取task的函数
 def run_task_status()->str:
@@ -1045,7 +1154,7 @@ def spawn_subagent(description: str)->str:
                 else:
                     try:
                         output = handler(**tool_args)
-                    
+
                     except Exception as e:
                         output = f"Error: {e}"
 
@@ -1293,9 +1402,18 @@ def agent_loop(messages: list):
     max_tokens = DEFAULT_MAX_TOKENS
     continuation_retries = 0
     while True:
-        
+
         #压缩上下文
         messages[:] = compact_history(messages)
+        #检查后台有没有线程完成
+        bg_notifications = collect_background_results()
+        if bg_notifications:
+            messages.append(
+                {
+                    "role": "user",
+                    "content": "\n\n".join(bg_notifications)
+                }
+            )
         #要搜寻相关记忆在记忆文件内
         selected_memories = select_relevant_memories(messages)
         memories = ""
@@ -1304,7 +1422,7 @@ def agent_loop(messages: list):
             memory_parts.append(read_memory_file(memory_name))
 
         memories = "\n\n".join(memory_parts)
-        
+
         #加入计划表更新计数器
         if rounds_since_todo >= 3 and messages:
             messages.append({
@@ -1350,7 +1468,7 @@ def agent_loop(messages: list):
                     f"model request failed: {e}",
                 )
             return
-        
+
         # SDK 返回的是对象；这里把 assistant message 转成 dict，方便加入 messages。
         message = response.choices[0].message
         assistant_message = message.model_dump(exclude_none=True)
@@ -1403,7 +1521,7 @@ def agent_loop(messages: list):
                 continue
             #更新任务状态
             current_task = get_current_task()
-            if current_task and current_task["status"] == "in_progress":
+            if current_task and current_task["status"] == "in_progress" and not has_running_background_tasks():
                 update_task(
                     current_task["id"],
                     "completed",
@@ -1433,11 +1551,18 @@ def agent_loop(messages: list):
 
             #得到具体函数
             handler = TOOL_HANDLERS.get(tool_name)
-            
+
             if handler is None:
                 logger.warning("unknown tool requested: %s", tool_call.function.name)
                 output = f"Error: Unknown tool {tool_call.function.name}"
-                
+            #判断是否需要作为后台任务异步进行
+            elif should_run_background(tool_name, tool_args):
+                bg_id = start_background_task(tool_call.id, tool_name, tool_args)
+                output = (
+                    f"[Background task {bg_id} started] "
+                    "Result will be available when complete."
+                )
+
             else:
                 try:
                     output = handler(**tool_args)
@@ -1445,7 +1570,7 @@ def agent_loop(messages: list):
                         rounds_since_todo = 0
                 except Exception as e:
                     output = f"Error: {e}"
-            
+
             trigger_hooks("PostToolUse", tool_name, tool_args, output)
             print(str(output)[:200])
             # 工具结果必须用 role=tool 和 tool_call_id 回填，模型才能接着推理。
@@ -1456,7 +1581,7 @@ if __name__ == "__main__":
     print("输入问题，回车发送。输入 q 退出。\n")
 
     history = []
-    
+
     while True:
         try:
             query = input("\033[36magent >> \033[0m")
