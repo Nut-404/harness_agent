@@ -12,6 +12,7 @@ import time
 import re
 import random
 import threading
+from datetime import datetime
 
 import ast
 import yaml
@@ -96,6 +97,25 @@ BACKGROUND_LOCK = threading.Lock()
 #用来生成 bg_id
 BACKGROUND_COUNTER = 0
 
+#定时任务记录
+#已经定好的任务
+SCHEDULED_JOBS = {}
+#已经到了时间但是还没运行的任务
+CRON_QUEUE = []
+#防止同一任务多次触发
+LAST_FIRED = {}
+#保护线程的锁
+CRON_LOCK = threading.Lock()
+#定时任务id
+CRON_COUNTER = 0
+
+#创建定时任务id
+def make_cron_id():
+    global CRON_COUNTER
+    with CRON_LOCK:
+        CRON_COUNTER += 1
+        return f"cron-{CRON_COUNTER}"
+
 #生成bg_id
 def make_background_id()->str:
     global BACKGROUND_COUNTER
@@ -171,6 +191,204 @@ def collect_background_results() -> list:
 def has_running_background_tasks() -> bool:
     with BACKGROUND_LOCK:
         return any(task["status"] == "running" for task in BACKGROUND_TASKS.values())
+
+#对比函数，用来处理时间的输入，对比
+def _cron_field_matches(field: str, value: int) -> bool:
+    if field == "*":
+        return True
+
+    for part in field.split(","):
+        part = part.strip()
+
+        if part.startswith("*/"):
+            step = int(part[2:])
+            if step <= 0:
+                return False
+            if value % step == 0:
+                return True
+            continue
+
+        if "-" in part:
+            start_text, end_text = part.split("-", 1)
+            start = int(start_text)
+            end = int(end_text)
+            if start <= value <= end:
+                return True
+            continue
+
+        if int(part) == value:
+            return True
+
+    return False
+
+#比较当前时间是否匹配输入时间
+def cron_matches(cron_expr: str, dt: datetime) -> bool:
+    fields = cron_expr.strip().split()
+    if len(fields) != 5:
+        return False
+
+    minute, hour, dom, month, dow = fields
+    dow_value = (dt.weekday() + 1) % 7
+
+    minute_ok = _cron_field_matches(minute, dt.minute)
+    hour_ok = _cron_field_matches(hour, dt.hour)
+    dom_ok = _cron_field_matches(dom, dt.day)
+    month_ok = _cron_field_matches(month, dt.month)
+    dow_ok = _cron_field_matches(dow, dow_value)
+
+    if not (minute_ok and hour_ok and month_ok):
+        return False
+
+    dom_unconstrained = dom == "*"
+    dow_unconstrained = dow == "*"
+
+    if dom_unconstrained and dow_unconstrained:
+        return True
+    if dom_unconstrained:
+        return dow_ok
+    if dow_unconstrained:
+        return dom_ok
+
+    return dom_ok or dow_ok
+
+#检查输入的单个时间参数是否合法
+def _validate_cron_field(field: str, low: int, high: int) -> str:
+    if not field:
+        return "empty field"
+
+    for part in field.split(","):
+        part = part.strip()
+        if not part:
+            return "empty list item"
+
+        if part == "*":
+            continue
+
+        if part.startswith("*/"):
+            step_text = part[2:]
+            if not step_text.isdigit():
+                return f"invalid step: {part}"
+            step = int(step_text)
+            if step <= 0:
+                return f"invalid step: {part}"
+            continue
+
+        if "-" in part:
+            start_text, end_text = part.split("-", 1)
+            if not start_text.isdigit() or not end_text.isdigit():
+                return f"invalid range: {part}"
+            start = int(start_text)
+            end = int(end_text)
+            if start > end:
+                return f"invalid range: {part}"
+            if start < low or end > high:
+                return f"out of range: {part}"
+            continue
+
+        if not part.isdigit():
+            return f"invalid value: {part}"
+
+        value = int(part)
+        if value < low or value > high:
+            return f"out of range: {part}"
+
+    return ""
+
+#检查总体的时间参数是否合法
+def validate_cron(cron_expr: str) -> str:
+    fields = cron_expr.strip().split()
+    if len(fields) != 5:
+        return "cron must have 5 fields: minute hour day month weekday"
+
+    minute, hour, dom, month, dow = fields
+
+    checks = [
+        ("minute", minute, 0, 59),
+        ("hour", hour, 0, 23),
+        ("day", dom, 1, 31),
+        ("month", month, 1, 12),
+        ("weekday", dow, 0, 6),
+    ]
+
+    for name, field, low, high in checks:
+        error = _validate_cron_field(field, low, high)
+        if error:
+            return f"{name}: {error}"
+
+    return ""
+
+#创建定时任务
+def schedule_job(cron: str, prompt: str, recurring: bool = True) -> str:
+    #如果不合法
+    error = validate_cron(cron)
+    if error:
+        return f"Error: invalid cron: {error}"
+    #创建基础信息
+    job_id = make_cron_id()
+    now = int(time.time())
+    #创建job
+    job = {
+        "id": job_id,
+        "cron": cron,
+        "prompt": prompt,#触发时交给llm的提示词
+        "recurring": recurring,#是否重复触发
+        "created_at": now,
+    }
+    #加进定时任务列表
+    with CRON_LOCK:
+        SCHEDULED_JOBS[job_id] = job
+
+    return f"Scheduled {job_id}: {cron} -> {prompt}"
+
+#删除已经完成或者不需要的定时任务
+def cancel_job(job_id: str) -> str:
+    with CRON_LOCK:
+        job = SCHEDULED_JOBS.pop(job_id, None)
+        LAST_FIRED.pop(job_id, None)
+
+    if not job:
+        return f"Error: cron job not found: {job_id}"
+
+    return f"Cancelled cron job {job_id}"
+
+#定时任务的主体
+def cron_scheduler_loop() -> None:
+    while True:
+        #一直检查是否到了时间
+        time.sleep(1)
+        now = datetime.now()
+        minute_marker = now.strftime("%Y-%m-%d %H:%M")
+
+        with CRON_LOCK:
+            jobs = list(SCHEDULED_JOBS.values())
+
+        for job in jobs:
+            try:
+                #没到时间
+                if not cron_matches(job["cron"], now):
+                    continue
+
+                with CRON_LOCK:
+                    if LAST_FIRED.get(job["id"]) == minute_marker:
+                        continue
+                    #不直接进行，只入队
+                    CRON_QUEUE.append(job.copy())
+                    LAST_FIRED[job["id"]] = minute_marker
+                    #一次性任务直接删除
+                    if not job.get("recurring", True):
+                        SCHEDULED_JOBS.pop(job["id"], None)
+
+            except Exception as e:
+                print(f"[cron error] {job.get('id', '?')}: {e}")
+
+#加入队列后需要触发行为，给llm取出来触发的函数
+def consume_cron_queue() -> list:
+    with CRON_LOCK:
+        jobs = list(CRON_QUEUE)
+        #每一轮的触发任务不一样，取出后就清空
+        CRON_QUEUE.clear()
+
+    return jobs
 
 #task id 生成
 def make_task_id()->str:
@@ -840,6 +1058,47 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "schedule_cron",
+            "description": "Schedule a prompt to run later or repeatedly using a five-field cron expression.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "cron": {"type": "string"},
+                    "prompt": {"type": "string"},
+                    "recurring": {"type": "boolean"},
+                },
+                "required": ["cron", "prompt"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_crons",
+            "description": "List all scheduled cron jobs.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cancel_cron",
+            "description": "Cancel a scheduled cron job by id.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "job_id": {"type": "string"},
+                },
+                "required": ["job_id"],
+            },
+        },
+    },
 ]
 #加载skill详细信息的函数
 def load_skill(name: str) -> str:
@@ -1007,6 +1266,24 @@ def run_task_update(status: str, result: str = "")->str:
         return "Error: no current task"
     return update_task(task["id"], status, result)
 
+
+def run_schedule_cron(cron: str, prompt: str, recurring: bool = True) -> str:
+    return schedule_job(cron, prompt, recurring)
+
+
+def run_list_crons() -> str:
+    with CRON_LOCK:
+        jobs = list(SCHEDULED_JOBS.values())
+
+    if not jobs:
+        return "No scheduled cron jobs."
+
+    return json.dumps(jobs, ensure_ascii=False, indent=2)
+
+
+def run_cancel_cron(job_id: str) -> str:
+    return cancel_job(job_id)
+
 #str name对应到具体的执行函数
 TOOL_HANDLERS = {
     "bash": run_bash,
@@ -1018,6 +1295,9 @@ TOOL_HANDLERS = {
     "load_skill": load_skill,
     "task_status": run_task_status,
     "task_update": run_task_update,
+    "schedule_cron": run_schedule_cron,
+    "list_crons": run_list_crons,
+    "cancel_cron": run_cancel_cron,
 }
 
 #sub agent的可用工具，不能再给task，因为可能会无限递归
@@ -1405,6 +1685,16 @@ def agent_loop(messages: list):
 
         #压缩上下文
         messages[:] = compact_history(messages)
+        #检查是否有定时任务
+        #已经在等待队列的任务
+        fired_jobs = consume_cron_queue()
+        for job in fired_jobs:
+            messages.append(
+                {
+                    "role": "user",
+                    "content": f"[Scheduled] {job['prompt']}"
+                }
+            )
         #检查后台有没有线程完成
         bg_notifications = collect_background_results()
         if bg_notifications:
@@ -1579,6 +1869,10 @@ def agent_loop(messages: list):
 if __name__ == "__main__":
     print("Harness Agent")
     print("输入问题，回车发送。输入 q 退出。\n")
+    #启动时创建线程来进行定时任务的监测
+    cron_thread = threading.Thread(target= cron_scheduler_loop, daemon= True)
+    cron_thread.start()
+    print("cron线程开启")
 
     history = []
 
