@@ -109,6 +109,57 @@ CRON_LOCK = threading.Lock()
 #定时任务id
 CRON_COUNTER = 0
 
+#多agent协作
+#通信邮箱地址
+MAILBOX_DIR = WORKDIR / ".mailboxes"
+MAILBOX_DIR.mkdir(exist_ok= True)
+#可用或已经存在的teammate agent
+ACTIVE_TEAMMATES = {}
+
+#多agent的消息发送函数
+def send_message(from_agent: str, to_agent: str, content: str, msg_type: str = "message"):
+    #创建消息
+    message = {
+        "from": from_agent,
+        "to": to_agent,
+        "content": content,
+        "type": msg_type,
+        "ts": time.time()
+    }
+    #to agent的邮箱地址
+    inbox = MAILBOX_DIR / f"{to_agent}.jsonl"
+    #写入
+    with inbox.open("a", encoding= "utf-8") as f:
+        f.write(json.dumps(message, ensure_ascii= False) + "\n")
+
+    return f"send message to {to_agent}"
+
+#多agent的接收消息
+def read_inbox(agent: str)->list:
+    inbox = MAILBOX_DIR / f"{agent}.jsonl"
+    if not inbox.exists():
+        return []
+    messages = []
+    for line in inbox.read_text(encoding= "utf-8").splitlines():
+        if not line.strip():
+            continue
+
+        try:
+            messages.append(json.loads(line))
+        except json.JSONDecodeError:
+            messages.append(
+                {
+                    "from": "system",
+                    "to": agent,
+                    "content": f"Error: invalid inbox line : {line}",
+                    "type": "error",
+                    "ts": time.time()
+                }
+            )
+    #阅读完就清空
+    inbox.unlink()
+    return messages
+
 #创建定时任务id
 def make_cron_id():
     global CRON_COUNTER
@@ -1099,6 +1150,59 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "send_message",
+            "description": "Send a message from the lead agent to a teammate inbox.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "to": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+                "required": ["to", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "check_inbox",
+            "description": "Read and consume the lead agent inbox.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "spawn_teammate",
+            "description": "Start a teammate agent thread with a name, role, and task prompt.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "role": {"type": "string"},
+                    "prompt": {"type": "string"},
+                },
+                "required": ["name", "role", "prompt"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_teammates",
+            "description": "List teammate agents and their current status.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+            },
+        },
+    },
 ]
 #加载skill详细信息的函数
 def load_skill(name: str) -> str:
@@ -1230,6 +1334,162 @@ def run_bash(command: str, run_in_background: bool = False):
     except (FileNotFoundError, OSError) as e:
         return f"Error: {e}"
 
+#多agent协作，lead agent专用的write和read工具
+def run_send_message(to: str, content: str) -> str:
+    return send_message("lead", to, content)
+
+
+def run_check_inbox() -> str:
+    messages = read_inbox("lead")
+    if not messages:
+        return "Inbox is empty."
+
+    return json.dumps(messages, ensure_ascii=False, indent=2)
+
+#teammate agent的tools
+TEAMMATE_TOOLS = [
+    TOOLS[0],  # bash
+    TOOLS[1],  # read_file
+    TOOLS[2],  # write_file
+    {
+        "type": "function",
+        "function": {
+            "name": "send_message",
+            "description": "Send a message to the lead agent or another teammate.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "to": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+                "required": ["to", "content"],
+            },
+        },
+    },
+]
+
+#多agent协作，lead agent创建teammate agent，开线程
+def spawn_teammate_thread(name:str, role: str, prompt: str)-> str:
+    if name in ACTIVE_TEAMMATES:
+        return f"Error: teammate already exists: {name}"
+
+    #线程函数,给lead发消息
+    def worker():
+        try:
+            def teammate_send_message(to: str, content: str)->str:
+                return send_message(name, to, content)
+            #给teammate agent用的函数映射
+            teammate_handlers = {
+            "bash": run_bash,
+            "read_file": run_read,
+            "write_file": run_write,
+            "send_message": teammate_send_message,
+            }
+            #创建teammate初始提示词
+            system = (
+                f"You are '{name}', a {role}. "
+                f"You are a teammate agent working at {WORKDIR}. "
+                "Use tools to complete the task. "
+                "When finished, send a concise result to 'lead' using send_message."
+            )
+            #自己的对话流程记忆，短期记忆
+            messages = [{"role": "user", "content": prompt}]
+            #循环10次，减少占用
+            for _ in range(10):
+                #读取是否有新消息
+                inbox = read_inbox(name)
+                if inbox:
+                    messages.append({
+                        "role": "user",
+                        "content": f"<inbox>{json.dumps(inbox, ensure_ascii=False)}</inbox>"
+                    })
+                #调用llm
+                response = with_retry(
+                    lambda: client.chat.completions.create(
+                        model=MODEL,
+                        messages=[{"role": "system", "content": system}, *messages],
+                        tools=TEAMMATE_TOOLS,
+                        max_tokens=DEFAULT_MAX_TOKENS,
+                    )
+                )
+                #提取信息
+                message = response.choices[0].message
+                assistant_message = message.model_dump(exclude_none=True)
+                messages.append(assistant_message)
+
+                if not message.tool_calls:
+                    break
+
+                for tool_call in message.tool_calls:
+                    tool_name = tool_call.function.name
+                    try:
+                        tool_args = json.loads(tool_call.function.arguments or "{}")
+                    except json.JSONDecodeError as e:
+                        output = f"Error: invalid JSON arguments for {tool_name}: {e}"
+                        messages.append(make_tool_result_message(tool_call.id, output))
+                        continue
+
+                    handler = teammate_handlers.get(tool_name)
+                    if handler is None:
+                        output = f"Error: Unknown tool {tool_name}"
+                    else:
+                        output = handler(**tool_args)
+
+                    messages.append(make_tool_result_message(tool_call.id, output))
+            #运行完后总结
+            summary = "Done."
+            #只总结运行调用的结果
+            for msg in reversed(messages):
+                if msg.get("role") == "assistant":
+                    summary = extract_text(msg) or summary
+                    break
+            #发送消息给lead
+            send_message(name, "lead", summary, "result")
+            #标志为完成
+            ACTIVE_TEAMMATES[name]["status"] = "completed"
+            ACTIVE_TEAMMATES[name]["completed_at"] = int(time.time())
+        except Exception as e:
+            ACTIVE_TEAMMATES[name]["status"] = "failed"
+            ACTIVE_TEAMMATES[name]["error"] = str(e)
+            ACTIVE_TEAMMATES[name]["completed_at"] = int(time.time())
+            send_message(name, "lead", f"Teammate failed: {e}", "error")
+
+    thread = threading.Thread(target= worker, daemon= True)
+    ACTIVE_TEAMMATES[name] = {
+        "name": name,
+        "role": role,
+        "status": "running",
+        "started_at": int(time.time()),
+        "thread": thread
+    }
+
+    thread.start()
+    return f"Spawned teammate {name} as {role}"
+
+
+def run_spawn_teammate(name: str, role: str, prompt: str) -> str:
+    return spawn_teammate_thread(name, role, prompt)
+
+
+# 给 lead agent 查看 teammate 线程状态；这和 check_inbox 不同，inbox 看消息，这里看运行状态。
+def run_list_teammates() -> str:
+    if not ACTIVE_TEAMMATES:
+        return "No active teammates."
+
+    teammates = []
+    for name, teammate in ACTIVE_TEAMMATES.items():
+        item = {
+            "name": name,
+            "role": teammate.get("role"),
+            "status": teammate.get("status"),
+            "started_at": teammate.get("started_at"),
+            "completed_at": teammate.get("completed_at"),
+            "error": teammate.get("error"),
+        }
+        teammates.append(item)
+
+    return json.dumps(teammates, ensure_ascii=False, indent=2)
+
 #判断是否是慢指令
 def is_slow_operation(tool_name: str, tool_args: dict)->bool:
     #不是bash命令运行的
@@ -1298,6 +1558,10 @@ TOOL_HANDLERS = {
     "schedule_cron": run_schedule_cron,
     "list_crons": run_list_crons,
     "cancel_cron": run_cancel_cron,
+    "send_message": run_send_message,
+    "check_inbox": run_check_inbox,
+    "spawn_teammate": run_spawn_teammate,
+    "list_teammates": run_list_teammates,
 }
 
 #sub agent的可用工具，不能再给task，因为可能会无限递归
@@ -1702,6 +1966,20 @@ def agent_loop(messages: list):
                 {
                     "role": "user",
                     "content": "\n\n".join(bg_notifications)
+                }
+            )
+
+        #检查是否由teammate agent的新消息
+        lead_inbox = read_inbox("lead")
+        if lead_inbox:
+            inbox_text = "\n".join(
+                f"From {msg.get('from')}: {msg.get('content')}"
+                for msg in lead_inbox
+            )
+            messages.append(
+                {
+                    "role": "user",
+                    "content": f"[Inbox]\n{inbox_text}"
                 }
             )
         #要搜寻相关记忆在记忆文件内
