@@ -13,6 +13,7 @@ import re
 import random
 import threading
 from datetime import datetime
+from dataclasses import dataclass, field
 
 import ast
 import yaml
@@ -116,14 +117,66 @@ MAILBOX_DIR.mkdir(exist_ok= True)
 #可用或已经存在的teammate agent
 ACTIVE_TEAMMATES = {}
 
+#teammate agent扫描任务板的间隔
+IDLE_POLL_INTERVAL = 5
+#没找到任务时就sleep
+IDLE_TIMEOUT = 60
+
+# 对于多agent之间消息格式的约束
+# 协议状态：记录 lead 和 teammate 之间正在等待回应的请求
+@dataclass
+class ProtocolState:
+    request_id: str
+    type: str  # "shutdown" | "plan_approval"
+    sender: str
+    target: str
+    status: str  # pending | approved | rejected
+    payload: str
+    created_at: float = field(default_factory=time.time)
+
+
+# request_id -> ProtocolState, 等待回应的请求
+PENDING_REQUESTS = {}
+
+
+# 创建协议请求 id，让请求和响应能对应起来
+def make_request_id() -> str:
+    return f"req_{random.randint(0, 999999):06d}"
+
+# 收到协议响应后，用 request_id 找到原请求，并更新状态
+def match_response(response_type: str, request_id: str, approve: bool) -> str:
+    state = PENDING_REQUESTS.get(request_id)
+    if not state:
+        return f"Error: unknown request_id: {request_id}"
+
+    # 防止 shutdown_response 错误地审批 plan_approval 请求
+    if state.type == "shutdown" and response_type != "shutdown_response":
+        return f"Error: type mismatch: expected shutdown_response, got {response_type}"
+
+    if state.type == "plan_approval" and response_type != "plan_approval_response":
+        return f"Error: type mismatch: expected plan_approval_response, got {response_type}"
+
+    if state.status != "pending":
+        return f"Request {request_id} already {state.status}"
+
+    state.status = "approved" if approve else "rejected"
+    return f"Protocol request {request_id} {state.status}"
+
 #多agent的消息发送函数
-def send_message(from_agent: str, to_agent: str, content: str, msg_type: str = "message"):
+def send_message(
+    from_agent: str,
+    to_agent: str,
+    content: str,
+    msg_type: str = "message",
+    metadata: dict | None = None,
+):
     #创建消息
     message = {
         "from": from_agent,
         "to": to_agent,
         "content": content,
         "type": msg_type,
+        "metadata": metadata or {},
         "ts": time.time()
     }
     #to agent的邮箱地址
@@ -158,6 +211,27 @@ def read_inbox(agent: str)->list:
             )
     #阅读完就清空
     inbox.unlink()
+    return messages
+
+
+# 统一读取 lead inbox：先处理协议响应，再把消息交给 LLM 看。
+def consume_lead_inbox(route_protocol: bool = True) -> list:
+    messages = read_inbox("lead")
+    if not messages:
+        return []
+
+    if route_protocol:
+        for message in messages:
+            metadata = message.get("metadata", {})
+            request_id = metadata.get("request_id", "")
+            msg_type = message.get("type", "")
+            if request_id and msg_type.endswith("_response"):
+                match_response(
+                    response_type=msg_type,
+                    request_id=request_id,
+                    approve=metadata.get("approve", False),
+                )
+
     return messages
 
 #创建定时任务id
@@ -441,12 +515,17 @@ def consume_cron_queue() -> list:
 
     return jobs
 
-#task id 生成
+#task id 生成, 防止同一时间创建多个相同的id
 def make_task_id()->str:
-    return f"task-{int(time.time())}"
+    return f"task-{int(time.time())}-{random.randint(0, 9999):04d}"
 
-#用任务描述创建任务
-def create_task(description: str):
+#用任务描述创建任务, 同时加上owner，可以让其他agent自动认领任务
+def create_task(
+        description: str,
+        status: str = "in_progress",
+        owner: str|None = None,
+        blockedBy: list | None = None
+):
     global CURRENT_TASK_ID
 
     task_id = make_task_id()
@@ -456,13 +535,15 @@ def create_task(description: str):
     task = {
         "id": task_id,
         "description": description,
-        "status": "in_progress",
+        "status": status,
+        "owner": owner,
+        "blockedBy": blockedBy or [],
         "created_at": now,
         "updated_at": now,
         "result": ""
     }
-
-    CURRENT_TASK_ID = task_id
+    if status == "in_progress":
+        CURRENT_TASK_ID = task_id
     TASKS[task_id] = task
     return task
 
@@ -482,6 +563,117 @@ def update_task(task_id: str, status: str, result: str = "") -> str:
         task["result"] = result
 
     return f"Updated task {task_id} to {status}"
+
+#自动agent认领任务判断是否可以认领，是否已经完成
+def can_start(task_id: str):
+    task = TASKS.get(task_id)
+    if not task:
+        return False
+    for dep_id in task.get("blockedBy", []):
+        dep = TASKS.get(dep_id)
+        if not dep:
+            return False
+        if dep.get("status") != "completed":
+            return False
+    return True
+
+#扫描任务板，看什么可以做
+def scan_unclaimed_tasks():
+    unclaimed = []
+
+    for task in TASKS.values():
+        if (
+            task.get("status") == "pending"
+            and not task.get("owner")
+            and can_start(task["id"])
+        ):
+            unclaimed.append(task)
+    return unclaimed
+
+#teammate agent空闲时轮询
+def idle_poll(agent_name: str, messages: list, role: str):
+    for _ in range(IDLE_TIMEOUT // IDLE_POLL_INTERVAL):
+        time.sleep(IDLE_POLL_INTERVAL)
+
+        #优先检查inbox，lead的消息比任务板重要
+        inbox = read_inbox(agent_name)
+        if inbox:
+            for msg in inbox:
+                if msg.get("type") == "shutdown_request":
+                    request_id = msg.get("metadata", {}).get("request_id", "")
+                    send_message(
+                        agent_name,
+                        "lead",
+                        "Shutting down gracefully.",
+                        "shutdown_response",
+                        {
+                            "request_id": request_id, "approve": True
+                        }
+                    )
+                    return "shutdown"
+
+            messages.append({
+                "role": "user",
+                "content": f"<inbox>{json.dumps(inbox, ensure_ascii=False)}</inbox>"
+            })
+            return "work"
+
+        #没有inbox任务，扫描任务板准备自己接任务
+        unclaimed = scan_unclaimed_tasks()
+        if unclaimed:
+            task = unclaimed[0]
+            result = claim_task(task["id"], owner= agent_name)
+            #如果成功修改状态，认领成功
+            if "Claimed" in result:
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        f"<auto-claimed>"
+                        f"Task {task['id']}: {task['description']}"
+                        f"</auto-claimed>"
+                    )
+                })
+                return "work"
+    return "timeout"
+
+#自动agent认领某个任务
+def claim_task(task_id: str, owner: str = "agent"):
+    task = TASKS.get(task_id)
+    #如果不存在任务直接返回
+    if not task:
+        return f"Error: task not found: {task_id}"
+    #如果不是代办状态直接返回
+    if task.get("status") != "pending":
+        return f"Task {task_id} is {task.get('status')}, cannot claim"
+    #如果已经被认领
+    if task.get("owner"):
+        return f"Task {task_id} already owned by {task.get('owner')}"
+    #前置任务没有完成
+    if not can_start(task_id):
+        return f"Task {task_id} is blocked"
+
+    task["owner"] = owner
+    task["status"] = "in_progress"
+    task["updated_at"] = int(time.time())
+
+    return f"Claimed {task_id}: {task.get('description')}"
+
+#完成任务时修改状态
+def complete_task(task_id: str, result: str = ""):
+    task = TASKS.get(task_id)
+    #如果没有这个任务
+    if not task:
+        return f"Error: task not found: {task_id}"
+    #如果不是处理中的任务，不能更改为完成
+    if task.get("status") != "in_progress":
+        return f"Task {task_id} is {task.get('status')}, cannot complete"
+    #更改任务状态
+    task["status"] = "completed"
+    task["updated_at"] = int(time.time())
+
+    if result:
+        task["result"] = result
+    return f"Completed {task_id}: {task.get('description')}"
 
 #读取当前任务，返回任务
 def get_current_task():
@@ -1112,6 +1304,64 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "create_task",
+            "description": "Create a pending task on the shared task board.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "description": {"type": "string"},
+                    "blockedBy": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                },
+                "required": ["description"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_tasks",
+            "description": "List all tasks on the shared task board.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "claim_task",
+            "description": "Claim a pending task from the shared task board.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string"},
+                },
+                "required": ["task_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "complete_task",
+            "description": "Complete an in-progress task on the shared task board.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string"},
+                    "result": {"type": "string"},
+                },
+                "required": ["task_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "schedule_cron",
             "description": "Schedule a prompt to run later or repeatedly using a five-field cron expression.",
             "parameters": {
@@ -1200,6 +1450,51 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "request_shutdown",
+            "description": "Request a teammate to shut down gracefully using a request/response protocol.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "teammate": {"type": "string"},
+                },
+                "required": ["teammate"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "request_plan",
+            "description": "Ask a teammate to submit a plan for a task.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "teammate": {"type": "string"},
+                    "task": {"type": "string"},
+                },
+                "required": ["teammate", "task"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "review_plan",
+            "description": "Approve or reject a teammate plan_approval request by request_id.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "request_id": {"type": "string"},
+                    "approve": {"type": "boolean"},
+                    "feedback": {"type": "string"},
+                },
+                "required": ["request_id", "approve"],
             },
         },
     },
@@ -1340,7 +1635,7 @@ def run_send_message(to: str, content: str) -> str:
 
 
 def run_check_inbox() -> str:
-    messages = read_inbox("lead")
+    messages = consume_lead_inbox(route_protocol=True)
     if not messages:
         return "Inbox is empty."
 
@@ -1366,6 +1661,60 @@ TEAMMATE_TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "submit_plan",
+            "description": "Submit a plan to the lead agent for approval.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "plan": {"type": "string"},
+                },
+                "required": ["plan"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_tasks",
+            "description": "List all tasks on the board.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "claim_task",
+            "description": "Claim a pending task.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string"},
+                },
+                "required": ["task_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "complete_task",
+            "description": "Mark an in-progress task as completed.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string"},
+                    "result": {"type": "string"},
+                },
+                "required": ["task_id"],
+            },
+        },
+    },
 ]
 
 #多agent协作，lead agent创建teammate agent，开线程
@@ -1373,35 +1722,109 @@ def spawn_teammate_thread(name:str, role: str, prompt: str)-> str:
     if name in ACTIVE_TEAMMATES:
         return f"Error: teammate already exists: {name}"
 
+    def handle_inbox_message(msg: dict, messages: list) -> bool:
+        # 协议消息不直接丢给 LLM 自由理解，而是先由程序按 type 分流处理。
+        msg_type = msg.get("type", "message")
+        metadata = msg.get("metadata", {})
+        request_id = metadata.get("request_id", "")
+
+        if msg_type == "shutdown_request":
+            send_message(
+                name,
+                "lead",
+                "Shutting down gracefully.",
+                "shutdown_response",
+                {"request_id": request_id, "approve": True},
+            )
+            return True
+
+        if msg_type == "plan_approval_response":
+            approve = metadata.get("approve", False)
+            if approve:
+                messages.append({
+                    "role": "user",
+                    "content": "[Plan approved] Proceed with the task.",
+                })
+            else:
+                messages.append({
+                    "role": "user",
+                    "content": f"[Plan rejected] Feedback: {msg.get('content', '')}",
+                })
+
+        return False
+
     #线程函数,给lead发消息
     def worker():
         try:
             def teammate_send_message(to: str, content: str)->str:
                 return send_message(name, to, content)
+
+            def teammate_submit_plan(plan: str) -> str:
+                return _teammate_submit_plan(name, plan)
+
+            def teammate_list_tasks() -> str:
+                if not TASKS:
+                    return "No tasks."
+                return json.dumps(list(TASKS.values()), ensure_ascii=False, indent=2)
+
+            def teammate_claim_task(task_id: str) -> str:
+                return claim_task(task_id, owner=name)
+
+            def teammate_complete_task(task_id: str, result: str = "") -> str:
+                return complete_task(task_id, result)
+
             #给teammate agent用的函数映射
             teammate_handlers = {
-            "bash": run_bash,
-            "read_file": run_read,
-            "write_file": run_write,
-            "send_message": teammate_send_message,
+                "bash": run_bash,
+                "read_file": run_read,
+                "write_file": run_write,
+                "send_message": teammate_send_message,
+                "submit_plan": teammate_submit_plan,
+                "list_tasks": teammate_list_tasks,
+                "claim_task": teammate_claim_task,
+                "complete_task": teammate_complete_task,
             }
             #创建teammate初始提示词
             system = (
                 f"You are '{name}', a {role}. "
                 f"You are a teammate agent working at {WORKDIR}. "
                 "Use tools to complete the task. "
+                "Check inbox messages for protocol requests. "
+                "If you need approval before risky work, use submit_plan. "
                 "When finished, send a concise result to 'lead' using send_message."
             )
             #自己的对话流程记忆，短期记忆
             messages = [{"role": "user", "content": prompt}]
-            #循环10次，减少占用
-            for _ in range(10):
-                #读取是否有新消息
+            shutdown_requested = False
+
+            while not shutdown_requested:
+                #重复多次自动压缩messages后，需要重新注入身份
+                if len(messages) <= 3:
+                    messages.insert(0,{
+                        "role": "user",
+                        "content": (
+                            f"<identity>You are '{name}', role: {role}. "
+                            f"Continue your work.</identity>"
+                        )
+                    })
+                #读取是否有新消息；协议消息先分流，普通消息再交给 LLM
                 inbox = read_inbox(name)
-                if inbox:
+                non_protocol_messages = []
+                for msg in inbox:
+                    if msg.get("type") in ("shutdown_request", "plan_approval_response"):
+                        shutdown_requested = handle_inbox_message(msg, messages)
+                        if shutdown_requested:
+                            break
+                    else:
+                        non_protocol_messages.append(msg)
+
+                if shutdown_requested:
+                    break
+
+                if non_protocol_messages:
                     messages.append({
                         "role": "user",
-                        "content": f"<inbox>{json.dumps(inbox, ensure_ascii=False)}</inbox>"
+                        "content": f"<inbox>{json.dumps(non_protocol_messages, ensure_ascii=False)}</inbox>"
                     })
                 #调用llm
                 response = with_retry(
@@ -1418,7 +1841,21 @@ def spawn_teammate_thread(name:str, role: str, prompt: str)-> str:
                 messages.append(assistant_message)
 
                 if not message.tool_calls:
-                    break
+                    # 没有工具调用时不立刻退出，而是进入 idle，等待 Lead 后续发协议消息或新任务。
+                    ACTIVE_TEAMMATES[name]["status"] = "idle"
+                    idle_result = idle_poll(name, messages, role)
+
+                    if idle_result == "work":
+                        ACTIVE_TEAMMATES[name]["status"] = "running"
+                        continue
+
+                    if idle_result == "shutdown":
+                        shutdown_requested = True
+                        break
+
+                    if idle_result == "timeout":
+                        break
+
 
                 for tool_call in message.tool_calls:
                     tool_name = tool_call.function.name
@@ -1467,6 +1904,27 @@ def spawn_teammate_thread(name:str, role: str, prompt: str)-> str:
     return f"Spawned teammate {name} as {role}"
 
 
+def _teammate_submit_plan(from_name: str, plan: str) -> str:
+    # teammate 发起计划审批：请求登记在同一本 PENDING_REQUESTS 账本里。
+    request_id = make_request_id()
+    PENDING_REQUESTS[request_id] = ProtocolState(
+        request_id=request_id,
+        type="plan_approval",
+        sender=from_name,
+        target="lead",
+        status="pending",
+        payload=plan,
+    )
+    send_message(
+        from_name,
+        "lead",
+        plan,
+        "plan_approval_request",
+        {"request_id": request_id},
+    )
+    return f"Plan submitted ({request_id}). Waiting for approval."
+
+
 def run_spawn_teammate(name: str, role: str, prompt: str) -> str:
     return spawn_teammate_thread(name, role, prompt)
 
@@ -1489,6 +1947,58 @@ def run_list_teammates() -> str:
         teammates.append(item)
 
     return json.dumps(teammates, ensure_ascii=False, indent=2)
+
+
+def run_request_shutdown(teammate: str) -> str:
+    request_id = make_request_id()
+    PENDING_REQUESTS[request_id] = ProtocolState(
+        request_id=request_id,
+        type="shutdown",
+        sender="lead",
+        target=teammate,
+        status="pending",
+        payload="Please shut down gracefully.",
+    )
+    send_message(
+        "lead",
+        teammate,
+        "Please shut down gracefully.",
+        "shutdown_request",
+        {"request_id": request_id},
+    )
+    return f"Shutdown request sent to {teammate} ({request_id})"
+
+
+def run_request_plan(teammate: str, task: str) -> str:
+    # 这是普通消息触发 teammate 自己调用 submit_plan；真正的审批请求由 teammate 发起。
+    return send_message(
+        "lead",
+        teammate,
+        f"Please submit a plan for: {task}",
+        "message",
+    )
+
+
+def run_review_plan(request_id: str, approve: bool, feedback: str = "") -> str:
+    state = PENDING_REQUESTS.get(request_id)
+    if not state:
+        return f"Error: unknown request_id: {request_id}"
+
+    if state.type != "plan_approval":
+        return f"Error: request {request_id} is {state.type}, not plan_approval"
+
+    if state.status != "pending":
+        return f"Request {request_id} already {state.status}"
+
+    state.status = "approved" if approve else "rejected"
+    send_message(
+        "lead",
+        state.sender,
+        feedback or ("Approved" if approve else "Rejected"),
+        "plan_approval_response",
+        {"request_id": request_id, "approve": approve},
+    )
+    return f"Plan {state.status} ({request_id})"
 
 #判断是否是慢指令
 def is_slow_operation(tool_name: str, tool_args: dict)->bool:
@@ -1527,6 +2037,30 @@ def run_task_update(status: str, result: str = "")->str:
     return update_task(task["id"], status, result)
 
 
+def run_create_task(description: str, blockedBy: list | None = None) -> str:
+    task = create_task(
+        description,
+        status="pending",
+        owner=None,
+        blockedBy=blockedBy,
+    )
+    return f"Created {task['id']}: {task['description']}"
+
+
+def run_list_tasks() -> str:
+    if not TASKS:
+        return "No tasks."
+    return json.dumps(list(TASKS.values()), ensure_ascii=False, indent=2)
+
+
+def run_claim_task(task_id: str) -> str:
+    return claim_task(task_id, owner="lead")
+
+
+def run_complete_task(task_id: str, result: str = "") -> str:
+    return complete_task(task_id, result)
+
+
 def run_schedule_cron(cron: str, prompt: str, recurring: bool = True) -> str:
     return schedule_job(cron, prompt, recurring)
 
@@ -1555,6 +2089,10 @@ TOOL_HANDLERS = {
     "load_skill": load_skill,
     "task_status": run_task_status,
     "task_update": run_task_update,
+    "create_task": run_create_task,
+    "list_tasks": run_list_tasks,
+    "claim_task": run_claim_task,
+    "complete_task": run_complete_task,
     "schedule_cron": run_schedule_cron,
     "list_crons": run_list_crons,
     "cancel_cron": run_cancel_cron,
@@ -1562,6 +2100,9 @@ TOOL_HANDLERS = {
     "check_inbox": run_check_inbox,
     "spawn_teammate": run_spawn_teammate,
     "list_teammates": run_list_teammates,
+    "request_shutdown": run_request_shutdown,
+    "request_plan": run_request_plan,
+    "review_plan": run_review_plan,
 }
 
 #sub agent的可用工具，不能再给task，因为可能会无限递归
@@ -1969,11 +2510,15 @@ def agent_loop(messages: list):
                 }
             )
 
-        #检查是否由teammate agent的新消息
-        lead_inbox = read_inbox("lead")
+        # 检查是否有 teammate agent 的新消息；协议响应要先路由更新 PENDING_REQUESTS。
+        lead_inbox = consume_lead_inbox(route_protocol=True)
         if lead_inbox:
             inbox_text = "\n".join(
-                f"From {msg.get('from')}: {msg.get('content')}"
+                (
+                    f"From {msg.get('from')} "
+                    f"[type={msg.get('type')}, request_id={msg.get('metadata', {}).get('request_id', '')}]: "
+                    f"{msg.get('content')}"
+                )
                 for msg in lead_inbox
             )
             messages.append(
