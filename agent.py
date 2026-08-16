@@ -122,6 +122,102 @@ IDLE_POLL_INTERVAL = 5
 #没找到任务时就sleep
 IDLE_TIMEOUT = 60
 
+#每个teammate要有自己的工作文件，worktree，避免相互覆盖
+# worktree 隔离目录
+WORKTREES_DIR = WORKDIR / ".worktrees"
+WORKTREES_DIR.mkdir(exist_ok=True)
+
+# 只允许简单安全的 worktree 名字，避免 ../ 这种路径穿越
+VALID_WORKTREE_NAME = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+
+# 确认是合法路径
+def validate_worktree_name(name: str) -> str | None:
+    if not name:
+        return "Worktree name cannot be empty"
+
+    if name in (".", ".."):
+        return f"Invalid worktree name: {name}"
+
+    if not VALID_WORKTREE_NAME.match(name):
+        return (
+            f"Invalid worktree name '{name}': "
+            "only letters, digits, dots, underscores, and dashes are allowed"
+        )
+
+    return None
+
+#统一执行git worktree指令
+def run_git(args: list[str]) -> tuple[bool, str]:
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=WORKDIR,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        output = (result.stdout + result.stderr).strip()
+        if not output:
+            output = "(no output)"
+
+        return result.returncode == 0, output[:5000]
+    except subprocess.TimeoutExpired:
+        return False, "Error: git timeout"
+
+#记录worktree操作动作，方便追踪
+def log_worktree_event(event_type: str, worktree_name: str, task_id: str = ""):
+    event = {
+        "type": event_type,
+        "worktree": worktree_name,
+        "task_id": task_id,
+        "ts": time.time(),
+    }
+
+    events_file = WORKTREES_DIR / "events.jsonl"
+    with events_file.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+#将任务绑定到worktree上
+def bind_task_to_worktree(task_id: str, worktree_name: str):
+    task = TASKS.get(task_id)
+    if not task:
+        return f"Error: task not found: {task_id}"
+
+    task["worktree"] = worktree_name
+    task["updated_at"] = int(time.time())
+
+    return f"Bound task {task_id} to worktree {worktree_name}"
+
+#创建worktree文件
+def create_worktree(name: str, task_id: str = "") -> str:
+    error = validate_worktree_name(name)
+    if error:
+        return f"Error: {error}"
+
+    path = WORKTREES_DIR / name
+    if path.exists():
+        return f"Error: worktree already exists: {name}"
+
+    ok, output = run_git([
+        "worktree",
+        "add",
+        str(path),
+        "-b",
+        f"wt/{name}",
+        "HEAD",
+    ])
+
+    if not ok:
+        return f"Git error: {output}"
+
+    if task_id:
+        bind_result = bind_task_to_worktree(task_id, name)
+        if bind_result.startswith("Error:"):
+            return bind_result
+
+    log_worktree_event("create", name, task_id)
+    return f"Created worktree {name} at {path}"
+
 # 对于多agent之间消息格式的约束
 # 协议状态：记录 lead 和 teammate 之间正在等待回应的请求
 @dataclass
@@ -538,6 +634,7 @@ def create_task(
         "status": status,
         "owner": owner,
         "blockedBy": blockedBy or [],
+        "worktree": None,
         "created_at": now,
         "updated_at": now,
         "result": ""
@@ -1362,6 +1459,21 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "create_worktree",
+            "description": "Create an isolated git worktree and optionally bind it to a task.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "task_id": {"type": "string"},
+                },
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "schedule_cron",
             "description": "Schedule a prompt to run later or repeatedly using a five-field cron expression.",
             "parameters": {
@@ -1549,18 +1661,20 @@ def run_todo_write(todos: list) -> str:
     return f"Updated {len(CURRENT_TODOS)} tasks"
 
 #确保路径安全，属于硬拒绝，不能写到外部
-def safe_path(p: str) -> Path:
+def safe_path(p: str, cwd: Path | None = None) -> Path:
+    # 默认在主工作目录；teammate 进入 worktree 后可以传 cwd，实现目录隔离。
+    base = (cwd or WORKDIR).resolve()
     #拼出路径
-    path = (WORKDIR / p).resolve()
-    if not path.is_relative_to(WORKDIR):
+    path = (base / p).resolve()
+    if not path.is_relative_to(base):
         raise ValueError(f"Path escapes workspace: {p}")
     return path
 
 #阅读文件
-def run_read(path: str, limit: Optional[int] = None) -> str:
+def run_read(path: str, limit: Optional[int] = None, cwd: Path | None = None) -> str:
     try:
         #用safe path保证路径正确
-        lines = safe_path(path).read_text().splitlines()
+        lines = safe_path(path, cwd=cwd).read_text(encoding="utf-8").splitlines()
         #限制取前limit行
         if limit and limit < len(lines):
             lines = lines[:limit] + [f"... ({len(lines) - limit} more lines)"]
@@ -1569,12 +1683,12 @@ def run_read(path: str, limit: Optional[int] = None) -> str:
         return f"Error: {e}"
 
 #写文件
-def run_write(path: str, content: str) -> str:
+def run_write(path: str, content: str, cwd: Path | None = None) -> str:
     try:
-        file_path = safe_path(path)
+        file_path = safe_path(path, cwd=cwd)
         #没有父文件的话一起创建父文件，文件已存在不报错
         file_path.parent.mkdir(parents=True, exist_ok=True)
-        file_path.write_text(content)
+        file_path.write_text(content, encoding="utf-8")
         return f"Wrote {len(content)} bytes to {path}"
     except Exception as e:
         return f"Error: {e}"
@@ -1605,7 +1719,7 @@ def run_glob(pattern: str) -> str:
     except Exception as e:
         return f"Error: {e}"
 
-def run_bash(command: str, run_in_background: bool = False):
+def run_bash(command: str, run_in_background: bool = False, cwd: Path | None = None):
     #异常拦截
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
     if any(d in command for d in dangerous):
@@ -1616,7 +1730,7 @@ def run_bash(command: str, run_in_background: bool = False):
         r = subprocess.run(
             command,
             shell= True,#用shell执行命令
-            cwd= os.getcwd(),#在当下文件执行命令
+            cwd= str((cwd or WORKDIR).resolve()),#默认主目录；teammate 可传 worktree 目录
             capture_output=True,#抓取输出
             text= True,#用字符串输出
             timeout= 120
@@ -1756,6 +1870,26 @@ def spawn_teammate_thread(name:str, role: str, prompt: str)-> str:
     #线程函数,给lead发消息
     def worker():
         try:
+            wt_ctx = {"path": None}
+
+            def current_workdir():
+                if wt_ctx["path"]:
+                    return Path(wt_ctx["path"])
+                return None
+
+            def teammate_bash(command: str, run_in_background: bool = False) -> str:
+                return run_bash(
+                    command,
+                    run_in_background=run_in_background,
+                    cwd=current_workdir(),
+                )
+
+            def teammate_read_file(path: str, limit: int | None = None) -> str:
+                return run_read(path, limit=limit, cwd=current_workdir())
+
+            def teammate_write_file(path: str, content: str) -> str:
+                return run_write(path, content, cwd=current_workdir())
+
             def teammate_send_message(to: str, content: str)->str:
                 return send_message(name, to, content)
 
@@ -1768,16 +1902,23 @@ def spawn_teammate_thread(name:str, role: str, prompt: str)-> str:
                 return json.dumps(list(TASKS.values()), ensure_ascii=False, indent=2)
 
             def teammate_claim_task(task_id: str) -> str:
-                return claim_task(task_id, owner=name)
+                result = claim_task(task_id, owner=name)
+
+                if "Claimed" in result:
+                    task = TASKS.get(task_id)
+                    if task and task.get("worktree"):
+                        wt_ctx["path"] = str(WORKTREES_DIR / task["worktree"])
+
+                return result
 
             def teammate_complete_task(task_id: str, result: str = "") -> str:
                 return complete_task(task_id, result)
 
             #给teammate agent用的函数映射
             teammate_handlers = {
-                "bash": run_bash,
-                "read_file": run_read,
-                "write_file": run_write,
+                "bash": teammate_bash,
+                "read_file": teammate_read_file,
+                "write_file": teammate_write_file,
                 "send_message": teammate_send_message,
                 "submit_plan": teammate_submit_plan,
                 "list_tasks": teammate_list_tasks,
@@ -2061,6 +2202,10 @@ def run_complete_task(task_id: str, result: str = "") -> str:
     return complete_task(task_id, result)
 
 
+def run_create_worktree(name: str, task_id: str = "") -> str:
+    return create_worktree(name, task_id)
+
+
 def run_schedule_cron(cron: str, prompt: str, recurring: bool = True) -> str:
     return schedule_job(cron, prompt, recurring)
 
@@ -2093,6 +2238,7 @@ TOOL_HANDLERS = {
     "list_tasks": run_list_tasks,
     "claim_task": run_claim_task,
     "complete_task": run_complete_task,
+    "create_worktree": run_create_worktree,
     "schedule_cron": run_schedule_cron,
     "list_crons": run_list_crons,
     "cancel_cron": run_cancel_cron,
