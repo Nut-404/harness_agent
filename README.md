@@ -12,6 +12,7 @@
 - subagent 调度
 - skill 按需加载
 - 简单上下文压缩
+- 多agent协作
 
 ## Setup
 
