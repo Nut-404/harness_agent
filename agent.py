@@ -361,7 +361,8 @@ def start_background_task(tool_call_id: str, tool_name: str, tool_args: dict) ->
         }
     #多线程函数
     def worker():
-        handler = TOOL_HANDLERS.get(tool_name)
+        _, handlers = assemble_tool_pool()
+        handler = handlers.get(tool_name)
         if handler is None:
             output = f"Error: Unknown tool {tool_name}"
         else:
@@ -1169,7 +1170,15 @@ def build_system(memories: str = "") -> str:
     #memory.md文件总结
     memory_index = read_memory_index()
     #列出所有支持的工具能力
-    enabled_tools = ",".join(TOOL_HANDLERS.keys())
+    _, handlers = assemble_tool_pool()
+    enabled_tools = ",".join(handlers.keys())
+    available_mcp_servers = ", ".join(MOCK_SERVERS.keys())
+    connected_mcp_servers = ", ".join(MCP_CLIENTS.keys()) or "(none)"
+    mcp_tool_names = ",".join(
+        name
+        for name in handlers.keys()
+        if name.startswith("mcp__")
+    ) or "(none)"
     #给出任务
     current_task = get_current_task()
 
@@ -1181,6 +1190,9 @@ def build_system(memories: str = "") -> str:
             "memory_index": memory_index,
             "memories": memories,
             "enable_tools": enabled_tools,
+            "available_mcp_servers": available_mcp_servers,
+            "connected_mcp_servers": connected_mcp_servers,
+            "mcp_tool_names": mcp_tool_names,
             "current_task": current_task
         },
         sort_keys= True,
@@ -1205,6 +1217,14 @@ def build_system(memories: str = "") -> str:
     sections.append(
         "Available tool names:\n"
         f"{enabled_tools}"
+    )
+    sections.append(
+        "MCP external tools:\n"
+        f"- Available mock MCP servers: {available_mcp_servers}\n"
+        f"- Connected MCP servers: {connected_mcp_servers}\n"
+        f"- Connected MCP tool names: {mcp_tool_names}\n"
+        "- Use connect_mcp(name) to connect a server before using its tools.\n"
+        "- MCP tools are named mcp__{server}__{tool}."
     )
     #展示当前任务
     if current_task:
@@ -1271,7 +1291,7 @@ def _normalize_todos(todos):
 
 #写tools工具列表，给llm看
 #第一个type代表了llm返回的参数必须是对象的形式，"xxx": "yyy"， 第二个单纯是代表了command时什么数据类型
-TOOLS = [
+BUILTIN_TOOLS = [
     {
         "type": "function",
         "function": {
@@ -1619,7 +1639,7 @@ def load_skill(name: str) -> str:
     return skill["content"]
 
 
-TOOLS.append({
+BUILTIN_TOOLS.append({
     "type": "function",
     "function": {
         "name": "load_skill",
@@ -1630,6 +1650,19 @@ TOOLS.append({
                 "name": {"type": "string"},
             },
             "required": ["name"],
+        },
+    },
+})
+
+
+BUILTIN_TOOLS.append({
+    "type": "function",
+    "function": {
+        "name": "compact",
+        "description": "Compact conversation history when context is getting long or noisy.",
+        "parameters": {
+            "type": "object",
+            "properties": {},
         },
     },
 })
@@ -1757,9 +1790,9 @@ def run_check_inbox() -> str:
 
 #teammate agent的tools
 TEAMMATE_TOOLS = [
-    TOOLS[0],  # bash
-    TOOLS[1],  # read_file
-    TOOLS[2],  # write_file
+    BUILTIN_TOOLS[0],  # bash
+    BUILTIN_TOOLS[1],  # read_file
+    BUILTIN_TOOLS[2],  # write_file
     {
         "type": "function",
         "function": {
@@ -2224,7 +2257,7 @@ def run_cancel_cron(job_id: str) -> str:
     return cancel_job(job_id)
 
 #str name对应到具体的执行函数
-TOOL_HANDLERS = {
+BUILTIN_HANDLERS = {
     "bash": run_bash,
     "read_file": run_read,
     "write_file": run_write,
@@ -2251,8 +2284,196 @@ TOOL_HANDLERS = {
     "review_plan": run_review_plan,
 }
 
+#某个外部服务的本地代理。MCP
+class MCPClient:
+    def __init__(self, name: str):
+        self.name = name
+        self.tools = []
+        self._handlers = {}
+
+    def register(self, tool_defs: list, handlers: dict):
+        self.tools = tool_defs
+        self._handlers = handlers
+
+    def call_tool(self, tool_name: str, args: dict):
+        handler = self._handlers.get(tool_name)
+        if handler is None:
+            return f"MCP error: unknown tool '{tool_name}'"
+
+        try:
+            return handler(**args)
+        except Exception as e:
+            return f"MCP error: {e}"
+
+MCP_CLIENTS = {}
+
+DISALLOWED_MCP_NAME_CHARS = re.compile(r"[^a-zA-Z0-9_-]")
+
+
+def normalize_mcp_name(name: str) -> str:
+    return DISALLOWED_MCP_NAME_CHARS.sub("_", name)
+
+#模拟两个mcp server, 都通过mcpclient来注册工具
+#docs server
+def _mock_server_docs():
+    client = MCPClient("docs")
+    client.register(
+        tool_defs=[
+            {
+                "name": "search",
+                "description": "Search documentation. (readOnly)",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                    },
+                    "required": ["query"],
+                },
+            },
+            {
+                "name": "get_version",
+                "description": "Get API version. (readOnly)",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "required": [],
+                },
+            },
+        ],
+        handlers={
+            "search": lambda query: f"[docs] Found 3 results for '{query}'",
+            "get_version": lambda: "[docs] API v2.1.0",
+        },
+    )
+    return client
+
+#deploy server
+def _mock_server_deploy():
+    client = MCPClient("deploy")
+    client.register(
+        tool_defs=[
+            {
+                "name": "trigger",
+                "description": "Trigger a deployment. (destructive)",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "service": {"type": "string"},
+                    },
+                    "required": ["service"],
+                },
+            },
+            {
+                "name": "status",
+                "description": "Check deployment status. (readOnly)",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "service": {"type": "string"},
+                    },
+                    "required": ["service"],
+                },
+            },
+        ],
+        handlers={
+            "trigger": lambda service: f"[deploy] Triggered: {service}",
+            "status": lambda service: f"[deploy] {service}: running (v1.4.2)",
+        },
+    )
+    return client
+
+#只是注册存在这些外部服务，不是已经注册成为mcpclient
+MOCK_SERVERS = {
+    "docs": _mock_server_docs,
+    "deploy": _mock_server_deploy,
+}
+
+#将存在的外部服务注册在全局环境内，成为一个mcpclient
+def connect_mcp(name: str) -> str:
+    #已经注册完了
+    if name in MCP_CLIENTS:
+        return f"MCP server '{name}' already connected"
+    factory = MOCK_SERVERS.get(name)
+    if not factory:
+        available = ", ".join(MOCK_SERVERS.keys())
+        return f"Unknown server '{name}'. Available: {available}"
+
+    mcp_client = factory()
+    MCP_CLIENTS[name] = mcp_client
+
+    tool_names = [tool["name"] for tool in mcp_client.tools]
+    tool_list = ", ".join(tool_names)
+    return (
+        f"Connected to MCP server '{name}'. "
+        f"Discovered {len(tool_names)} tools: {tool_list}"
+    )
+
+
+def run_connect_mcp(name: str) -> str:
+    return connect_mcp(name)
+
+
+BUILTIN_TOOLS.append({
+    "type": "function",
+    "function": {
+        "name": "connect_mcp",
+        "description": (
+            "Connect to a mock MCP server by name. "
+            "Available servers: docs, deploy. "
+            "After connecting, the server's tools become available in later turns."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+            },
+            "required": ["name"],
+        },
+    },
+})
+BUILTIN_HANDLERS["connect_mcp"] = run_connect_mcp
+
+
+def make_mcp_handler(mcp_client: MCPClient, tool_name: str):
+    def handler(**kwargs):
+        return mcp_client.call_tool(tool_name, kwargs)
+
+    return handler
+
+
+#返回内置tools，handler和外部的tools和handler。TOOLS和HANDLER作为内置的tool
+def assemble_tool_pool():
+    tools = list(BUILTIN_TOOLS)
+    handlers = dict(BUILTIN_HANDLERS)
+
+    for server_name, mcp_client in MCP_CLIENTS.items():
+        safe_server = normalize_mcp_name(server_name)
+
+        for tool_def in mcp_client.tools:
+            original_tool_name = tool_def["name"]
+            safe_tool = normalize_mcp_name(original_tool_name)
+            prefixed_name = f"mcp__{safe_server}__{safe_tool}"
+
+            tools.append({
+                "type": "function",
+                "function": {
+                    "name": prefixed_name,
+                    "description": tool_def.get("description", ""),
+                    "parameters": tool_def.get("inputSchema", {
+                        "type": "object",
+                        "properties": {},
+                    }),
+                },
+            })
+            handlers[prefixed_name] = make_mcp_handler(
+                mcp_client,
+                original_tool_name,
+            )
+
+    return tools, handlers
+
 #sub agent的可用工具，不能再给task，因为可能会无限递归
-SUB_TOOLS = TOOLS[:5]
+SUB_TOOLS = BUILTIN_TOOLS[:5]
 
 #sub agent的函数对应表
 SUB_HANDLERS = {
@@ -2301,6 +2522,8 @@ PERMISSION_RULES = [
 
 #软拒绝函数，检查是否存在风险行为
 def check_rules(tool_name: str, args: dict) -> Optional[str]:
+    if tool_name.startswith("mcp__") and "__deploy__" in tool_name:
+        return f"MCP deploy tool may change external state: {tool_name}"
     #每条软拒绝规则检查
     for rule in PERMISSION_RULES:
         if tool_name in rule["tools"] and rule["check"](args):
@@ -2397,7 +2620,7 @@ def spawn_subagent(description: str)->str:
     return extract_text(messages[-1]) or "Subagent finished without a text response."
 
 
-TOOLS.append({
+BUILTIN_TOOLS.append({
     "type": "function",
     "function": {
         "name": "task",
@@ -2411,7 +2634,7 @@ TOOLS.append({
         },
     },
 })
-TOOL_HANDLERS["task"] = spawn_subagent
+BUILTIN_HANDLERS["task"] = spawn_subagent
 
 #压缩上下文，确定messages从哪里开始切开
 COMPACT_TRIGGER_MESSAGES = 20 #messages最大长度
@@ -2691,13 +2914,14 @@ def agent_loop(messages: list):
             rounds_since_todo = 0
         #输出日志
         logger.info("requesting model=%s messages=%d", MODEL, len(messages))
+        tools, handlers = assemble_tool_pool()
         try:
             #连接llm获得回答
             response = with_retry(
                 lambda: client.chat.completions.create(
                     model=MODEL,
                     messages=[{"role": "system", "content": build_system(memories=memories)}, *messages],
-                    tools=TOOLS,
+                    tools=tools,
                     max_tokens=max_tokens,
                 )
             )
@@ -2802,6 +3026,12 @@ def agent_loop(messages: list):
                 messages.append(make_tool_result_message(tool_call_id= tool_call.id, output= output))
                 continue
 
+            if tool_name == "compact":
+                messages[:] = compact_history(messages)
+                output = "Compacted conversation history. Continue with the summarized context."
+                messages.append(make_tool_result_message(tool_call_id=tool_call.id, output=output))
+                continue
+
             #用hook来走pretooluse流程
             blocked = trigger_hooks("PreToolUse", tool_name, tool_args)
             if blocked:
@@ -2809,7 +3039,7 @@ def agent_loop(messages: list):
                 continue
 
             #得到具体函数
-            handler = TOOL_HANDLERS.get(tool_name)
+            handler = handlers.get(tool_name)
 
             if handler is None:
                 logger.warning("unknown tool requested: %s", tool_call.function.name)
